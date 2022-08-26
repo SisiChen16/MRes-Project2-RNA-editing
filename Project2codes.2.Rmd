@@ -1,0 +1,1555 @@
+---
+title: "Project2codes.2"
+output: html_notebook
+---
+
+# Load packages 
+```{r}
+library(ggplot2)
+library(tidyr)
+library(tidyverse)
+library(dplyr)
+library(fst)
+library(broom)
+library(ggpubr)
+library(lme4)
+library(stringr)
+library(lmerTest)
+library(pheatmap)
+```
+
+# ggplot: set theme 
+```{r}
+my_theme <- theme(axis.text.y = element_text(size = 12), axis.title.y = element_text(size = 14),
+                  axis.text.x = element_text(size = 12), axis.title.x = element_text(size = 14),
+                  plot.title = element_text(size = 16), legend.text = element_text(size = 12), 
+                  legend.title = element_text(size =12)) + 
+            theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                  panel.background = element_blank(), axis.line = element_line(colour = "black"),
+                  panel.border = element_blank())
+```
+
+# Import data
+```{r}
+rna_editing <- read_fst("2022-05-04_rna_editing_table.fst")
+rna_editing_effect <- read_fst("2022-05-16_rna_editing_table.fst")
+hla <- read.csv("hla_allele_cohort.csv")
+imm_infiltrate <- read.csv("immune_clusters.csv")
+transcript <- read.fst("2022-04-28_rsem_tpm_mat.fst")
+neoantigen <- read.fst("2022-05-25_neoantigens_editing.fst")
+
+# Load purity data  (DNA and RNA and get variance)
+purity_all <- read.table("20220427_TRACERx421_manual_qc_sheet.tsv", sep = "\t",
+                         stringsAsFactors = FALSE, header = TRUE)
+  # Make sure relevant numeric variables are numeric
+purity_all$ASCAT.purity <- as.numeric(purity_all$ASCAT.purity)
+purity_all$Adjust_ASCAT.purity <- as.numeric(purity_all$Adjust_ASCAT.purity)
+
+#The field 'ManualCall' informs of whether the purity was estimated in the first place. OK means it 
+# worked at the first attempt (info about purity is thus under the field 'ASCATpurity'. RERUN or
+#RERUN_NOVEL indicate that the sample had to be rerun, in those cases purity is under 
+#'Adjust_ASCAT.purity'
+purity_all$purity <- ifelse(purity_all$ManualCall == "OK", purity_all$ASCAT.purity, NA)
+purity_all$purity <- ifelse(purity_all$ManualCall == "RERUN" | purity_all$ManualCall == "RERUN_NOVEL",
+                            purity_all$Adjust_ASCAT.purity, purity_all$purity)
+
+region_purity <- purity_all[, c("Sample", "purity")]
+
+region_purity$Sample <- gsub(pattern = "\\.",
+                             replacement = "-",
+                             x = region_purity$Sample)
+
+colnames(region_purity) <- c("patient_region", "purity")
+
+# RNA editing data 
+tumour_id <- rna_editing %>% select(rna_ids, patient_region, patient, tumour_id)
+rna_editing <- inner_join(rna_editing_effect, tumour_id) %>% distinct()
+
+# Merge the imm_infiltrate column with rna_editing 
+colnames(imm_infiltrate)[1] <- "patient_region"
+rna_editing <- left_join(rna_editing, imm_infiltrate) %>% distinct()
+```
+
+# Data Filtering 
+## RNA editing data 
+```{r}
+# RNA editing data 
+rna_editing %>% 
+  ggplot(aes(all_var_count, all_cov, color = PASS_present)) + geom_point()  
+
+# Filtered RNA_editing dataset by PASS_present, PASS_homo_nt, muttype_nostrand and gene symbol 
+rna_editing_filtered <- rna_editing %>% 
+  filter(PASS_present == "TRUE",PASS_homo_nt == "TRUE",muttype_nostrand != "*")  
+
+# Remove the duplicated rna_ids events (which only differ in gene symbol)
+#rna_editing$symbol <- NULL
+#rna_editing <- unique(rna_editing)
+
+# Remove NA in tumour_ids -- retain only tumour samples -------------------------------------
+# rna_editing <- rna_editing[!is.na(rna_editing$tumour_id),]
+
+# Extract the patient IDs (two different approaches)
+  # Method 1 
+#rna_editing_filtered$patient <- gsub(pattern = "_.+",
+#                                  replacement = "",
+#                                  x = rna_editing_filtered$patient_region)
+  # Method 2 
+#rna_editing_filtered$patient <- vapply(strsplit(rna_editing_filtered$patient_region,split = "_"), `[`, 1, FUN.VALUE=character(1))
+
+length(unique(rna_editing_filtered$patient)) # number of patients
+```
+## Filter out the common RNA editing events (>10) and hla types (>20)
+```{r}
+# Filter out the common RNA editing events and hla types 
+rna_editing_filtered_sub <- rna_editing_filtered %>% group_by(rna_ids) %>% mutate(nb_tumour = n_distinct(tumour_id)) %>% filter(nb_tumour > 10) %>% distinct() # common RNA editing events is defined as the RNA_ids which present in more than 10 tumour samples 
+
+length(unique(rna_editing_filtered$rna_ids))
+length(unique(rna_editing_filtered_sub$rna_ids))
+
+# HLA data 
+hla <- hla %>%  #Substitute "-" with its homozygous allele type 
+  group_by(hla_type, patient) %>% 
+  mutate(hla_allele_type = ifelse(hla_allele_type == "-", 
+                                 hla_allele_type[allele == "allele_1"], 
+                                 hla_allele_type))
+
+common_hla <- sort(table(hla$hla_allele_type),decreasing = TRUE)
+common_hla <- names(common_hla)[common_hla > 20] # cut-off value for common hla allele type set to be 20
+hla_sub <- hla[hla$hla_allele_type %in% common_hla,] 
+hla_sub <- hla %>% filter(hla_allele_type != "Not typed") %>% distinct()
+
+```
+
+## Resolve those cases where the same rna_ids are attributed to two different muttypes
+```{r}
+rna_editing_filtered_sub %>% 
+  group_by(rna_ids) %>% 
+  summarize(nb = n_distinct(muttype_nostrand)) %>% 
+  filter(nb > 1)
+
+# Three cases: chr1:192685460:T:C  chr20:62326431:T:C  chr6:116579891:A:G
+rna_editing_filtered_sub %>% 
+  filter(rna_ids == "chr1:192685460:T:C") %>% 
+  dplyr::select(rna_ids, muttype_nostrand) %>% 
+  count(muttype_nostrand)
+
+rna_editing_filtered_sub2 <- rna_editing_filtered_sub[!(rna_editing_filtered_sub$rna_ids == "chr1:192685460:T:C" & rna_editing_filtered_sub$muttype_nostrand == "A>G"), ]
+
+rna_editing_filtered_sub %>% 
+  filter(rna_ids == "chr20:62326431:T:C") %>% 
+  dplyr::select(rna_ids, muttype_nostrand) %>% 
+  count(muttype_nostrand)
+
+rna_editing_filtered_sub2 <- rna_editing_filtered_sub2[!(rna_editing_filtered_sub2$rna_ids == "chr20:62326431:T:C" & rna_editing_filtered_sub2$muttype_nostrand == "T>C"), ]
+
+rna_editing_filtered_sub %>% 
+  filter(rna_ids == "chr6:116579891:A:G") %>% 
+  dplyr::select(rna_ids, muttype_nostrand) %>% 
+  count(muttype_nostrand)
+
+rna_editing_filtered_sub2 <- rna_editing_filtered_sub2[!(rna_editing_filtered_sub2$rna_ids == "chr6:116579891:A:G" & rna_editing_filtered_sub2$muttype_nostrand == "A>G"), ]
+```
+
+## Neoantigen data 
+```{r}
+# Neoantigen data 
+rna_ids <- data.frame() # Merge the information from several columns and add a new column to the data.frame as rna_ids
+ for (i in 1:length(rownames(neoantigen))){
+  ids <- paste0(neoantigen$CHROM[i],":", neoantigen$POS[i], 
+                ":",neoantigen$REF[i],":",neoantigen$ALT[i])
+  rna_ids <- rbind(rna_ids, ids)
+}
+  # colnames(rna_ids) <- "rna_ids"
+  # neoantigen <- cbind(rna_ids, neoantigen)
+
+neoantigen$rna_ids <- paste0(neoantigen$CHROM,":", neoantigen$POS,":",neoantigen$REF,":",neoantigen$ALT)
+neoantigen2 <- neoantigen %>% 
+  select(rna_ids,NAG_netMHCpan.EL_Score,NAG_netMHCpan.EL_GL_Score,NAG_netMHCpan.BA_Score,NAG_netMHCpan.EL_HLA) %>% distinct()
+colnames(neoantigen2) <- c("rna_ids","EL_score","EL_GL_score","BA_score", "HLA")
+```
+
+# Merging data
+```{r}
+## Merged data 
+merged_data <- inner_join(rna_editing_filtered_sub2, hla_sub) %>% distinct() #Whether or not filtering the common rna_editing events 
+load("merged_data.RData")
+merged_data <- left_join(merged_data, region_purity) %>% distinct()
+#save(merged_data, file = "merged_data.RData")
+
+
+## Add extra columns to merged data
+# Classify tumour and normal types based on patient regions 
+merged_data$sample_type <- ifelse(grepl("SU_N", merged_data$samples),
+                                                 "normal", "tumour")
+# Classify Primary and Secondary tumours 
+merged_data <- merged_data %>% 
+  mutate(status = case_when(startsWith(samples,"SU_T") ~ "Primary", 
+                            startsWith(samples,"SU_LN")~ "Primary",
+                            startsWith(samples,"BR") ~"Meta_recur", 
+                            startsWith(samples,"BP") ~"Meta_recur",
+                            startsWith(samples,"MR") ~"Meta_recur")) %>% distinct()
+
+# Add a column to indicate whether the RNA editing events are tumour-specific
+merged_data$combine <- str_c(merged_data$rna_ids,"_", merged_data$hla_allele_type)
+test <- merged_data %>% group_by(patient) %>% mutate(nb = n_distinct(sample_type)) %>% filter(nb > 1) %>% distinct() #subset merged_data to get patients with both normal and tumour samples (n = 90)
+length(unique(test$patient))
+patients <- unique(test$patient)
+
+test2 <- data.frame()
+for (x in patients){
+  data <- test %>% filter(patient == x) 
+  normal <- data %>% filter(sample_type == "normal")
+  tumour <- data %>% filter(sample_type == "tumour")
+  
+  normal <- unique(normal$combine)
+  tumour <- unique(tumour$combine)
+  
+  data$feature <- "normal-specific"
+  data$feature[which(data$combine %in% intersect(tumour,normal))] <- "shared"
+  data$feature[which(data$combine %in% setdiff(tumour,normal))] <- "tumour-specific"
+  
+  test2 <- rbind(test2, data)
+}
+colnames(test2)
+
+merged_data <- left_join(merged_data, test2)
+#save(merged_data, file = "merged_data.RData")
+
+# Identify neoantigenic RNA_ids
+neoantigen <- merged_data %>% filter(effect == "nonsynonymous", EL_score < 0.1, EL_GL_score > EL_score, all_cov > 60)
+neoantigen$neoantigenic <- TRUE
+
+merged_data$neoantigenic <- NULL
+merged_data <- left_join(merged_data, neoantigen)
+merged_data$neoantigenic[which(is.na(merged_data$neoantigenic))] <- FALSE
+#save(merged_data, file = "merged_data.RData")
+```
+
+## merged_data_mhc1 & merged_data2
+```{r}
+merged_data_mhc1 <- merged_data %>% filter(hla_type == "A"| hla_type == "B"| hla_type == "C", effect == "nonsynonymous")
+merged_data_mhc1$HLA = str_sub(merged_data_mhc1$hla_allele_type,1,11)
+merged_data_mhc1 <- inner_join(merged_data_mhc1, neoantigen2) 
+
+merged_data <- left_join(merged_data, merged_data_mhc1)
+#save(merged_data_mhc1, file = "merged_data_mhc1.RData")
+
+merged_data2 <- merged_data %>% 
+  filter(!is.na(tumour_id), effect == "nonsynonymous") %>% 
+  select(rna_ids,hla_allele_type, hla_type, combine, all_vaf, all_cov, present_normal, muttype_nostrand, patient_region, symbol, effect, patient, tumour_id, samples, immune_cat, histology, purity, sample_type, feature, status, EL_score) %>% 
+  distinct() %>% group_by(hla_allele_type) %>%
+  mutate(total_tumour = n_distinct(tumour_id), total_region = n_distinct(patient_region)) 
+#save(merged_data2, file = "merged_data2.RData")
+```
+
+# Load processed data 
+```{r}
+load("merged_data.RData") # Merged data which contain all the available information, include both normal and tumour samples after filtering -- contain all the columns I need
+load("merged_data2.RData") # Contain only rna_editing events in tumour samples and with nonsynonymous effect, select columns of interest 
+  # total_tumour -- number of tumour_ids which carry specific rna_ids
+  # total_region -- number of patient regions which carry specific rna_ids
+load("merged_data_mhc1.RData") 
+  # Contain both normal and tumour samples, Filtered by HLA_type 1 (A,B,C), # effect == "non-synonymous"  # without filtering by EL_score < 0.05 (might change in future)
+load("rna_editing_hla.RData")
+load("merged_diff2.RData") # RNA editing events which are more common in cold than hot regions 
+load("DEanalysis.RData")
+load("merged_diff3.RData")
+load("lohhla_data.RData") # load lohhla_data 
+```
+
+# Data Exploration
+## Data Exploration (1) 
+```{r}
+# Number of unique RNA editing events per tumour/patient
+merged_data %>% 
+  filter(!is.na(tumour_id)) %>% group_by(patient) %>% 
+  summarize(nb_editing = n_distinct(rna_ids)) %>% ggplot(aes(x = patient, y = nb_editing)) + geom_col() + theme(axis.text.x = element_blank())
+
+merged_data %>% 
+  filter(!is.na(tumour_id)) %>% group_by(tumour_id) %>% 
+  summarize(nb_editing = n_distinct(rna_ids)) %>% ggplot(aes(x = tumour_id, y = nb_editing)) + geom_col() + theme(axis.text.x = element_blank())
+
+# no of tumour_id per patient
+merged_data %>% filter(!is.na(tumour_id)) %>% group_by(patient) %>% summarize(nb_tumour = n_distinct(tumour_id)) %>% 
+  ggplot(aes(x = patient, y = nb_tumour)) + geom_col() + theme(axis.text.x = element_blank()) + labs(title = "no of tumour_ids per patient")
+
+# no of regions sampled per patient 
+merged_data %>% filter(!is.na(tumour_id)) %>% group_by(patient) %>% summarize(nb_region = n_distinct(patient_region)) %>% 
+  ggplot(aes(x = patient, y = nb_region)) + geom_col() + theme(axis.text.x = element_blank()) + labs(title = "no of patient regions per patient")
+
+length(unique(merged_data$tumour_id))
+length(unique(merged_data$patient))
+length(unique(merged_data$patient_region))
+
+merged_data %>% filter(!is.na(immune_cat)) %>% group_by(immune_cat) %>% summarize(nb = n_distinct(patient_region))
+
+```
+
+## Data exploration (2) 气泡图 for all HLA types (by nb_tumour or proportion) 
+```{r}
+merged_data_rna_ids <- merged_data2 %>%
+  # RNA editing events in tumour samples with nonsynonymous effect only 
+  group_by(rna_ids, hla_allele_type, muttype_nostrand, hla_type) %>% 
+  mutate(nb_tumour = n_distinct(tumour_id))
+
+merged_data_rna_ids_percent <- merged_data_rna_ids %>% 
+  group_by(rna_ids,hla_type) %>% 
+  mutate(total = sum(nb_tumour)) %>% 
+  mutate(proportion = nb_tumour/total) %>% 
+  select(rna_ids, hla_allele_type, hla_type, muttype_nostrand, nb_tumour, proportion) %>% distinct()
+
+unique_hla_type <- unique(merged_data_rna_ids$hla_type)
+unique_muttype <- unique(merged_data_rna_ids$muttype_nostrand)
+
+for (i in 1:length(unique_hla_type)){
+  for (j in 1:length(unique_muttype)){
+    title <- paste0("HLA type ",unique_hla_type[i]," & Muttype ",unique_muttype[j])
+    p <- merged_data_rna_ids %>% 
+      filter(hla_type == unique_hla_type[i], muttype_nostrand == unique_muttype[j]) %>% 
+      ggplot(aes(x = rna_ids, y = hla_allele_type, size = nb_tumour)) + # proportion 
+      geom_point(alpha = .6) + labs(title = title) + 
+      theme(axis.text.x = element_text(angle = 90,  vjust = 0.5, hjust=1), 
+        plot.title = element_text(hjust = 0.5))
+    
+    plot(p)
+  }
+}
+
+```
+
+## Data exploration (3) 气泡图 for only HLA class I with strong binding affinity (EL_score < 0.05) 
+```{r}
+# merged_data_mhc1 -- data merged with neoantigen binding affinity and filtered by EL_score < 0.05, contain normal samples (need to be filtered by is.na(tumour_id))
+merged_data_mhc1 %>% filter(!is.na(tumour_id), hla_type == "A", effect == "nonsynonymous",
+                            EL_score < 0.05) %>% 
+  group_by(rna_ids, hla_allele_type) %>% 
+  mutate(nb_tumour = n_distinct(tumour_id)) %>% 
+  ggplot(aes(x = rna_ids, y = hla_allele_type, size = nb_tumour, color = symbol)) + geom_point(alpha = .6) +
+      theme(axis.text.x = element_text(angle = 90,  vjust = 0.5, hjust=1), 
+        plot.title = element_text(hjust = 0.5)) 
+
+merged_data_mhc1 %>% filter(!is.na(tumour_id),hla_type == "B", effect == "nonsynonymous",
+                            EL_score < 0.05) %>% 
+  group_by(rna_ids, hla_allele_type) %>% 
+  mutate(nb_tumour = n_distinct(tumour_id)) %>% 
+  ggplot(aes(x = rna_ids, y = hla_allele_type, size = nb_tumour, color = symbol)) + geom_point(alpha = .6) +
+      theme(axis.text.x = element_text(angle = 90,  vjust = 0.5, hjust=1), 
+        plot.title = element_text(hjust = 0.5)) 
+
+merged_data_mhc1 %>% filter(!is.na(tumour_id),hla_type == "C", effect == "nonsynonymous",
+                            EL_score < 0.05) %>% 
+  group_by(rna_ids, hla_allele_type) %>% 
+  mutate(nb_tumour = n_distinct(tumour_id)) %>% 
+  ggplot(aes(x = rna_ids, y = hla_allele_type, size = nb_tumour, color = symbol)) + geom_point(alpha = .6) +
+      theme(axis.text.x = element_text(angle = 90,  vjust = 0.5, hjust=1), 
+        plot.title = element_text(hjust = 0.5)) 
+
+```
+
+## Data exploration (4) heatmap 
+```{r}
+## Heatmap by proportion 
+data_hla1 <- merged_data2 %>% 
+  filter(hla_type == "A"|hla_type == "B"|hla_type == "C") %>% 
+  group_by(hla_allele_type) %>% mutate(nb_tumour_total = n_distinct(tumour_id)) %>% 
+  group_by(rna_ids, hla_allele_type) %>% mutate(nb_tumour = n_distinct(tumour_id)) %>% 
+  summarize(proportion = nb_tumour / nb_tumour_total) %>% distinct()
+
+data_hla1_pivot <- data_hla1 %>% 
+  pivot_wider(names_from = c(hla_allele_type), values_from = proportion) %>% 
+  column_to_rownames(var= "rna_ids")
+
+data_hla1_pivot[1:5,1:5]
+data_hla1_pivot[is.na(data_hla1_pivot)] <- 0
+
+# Annotations 
+  # HLA_types 
+hla_col <- merged_data2 %>% 
+  filter(hla_type == "A"|hla_type == "B"|hla_type == "C") %>% 
+  group_by(hla_allele_type) %>% 
+  summarize(nb_tumour_hla = n_distinct(tumour_id)) %>% select(hla_allele_type, nb_tumour_hla) %>% 
+  distinct()
+hla_col$HLA_type <- substr(hla_col$hla_allele_type,1,5)
+hla_col <- hla_col %>% column_to_rownames(var = "hla_allele_type")
+
+  # Rna_ids --> muttype_nostrand, effect 
+rna_col <- merged_data2 %>% 
+  filter(hla_type == "A"|hla_type == "B"|hla_type == "C") %>% 
+  group_by(rna_ids) %>% 
+  mutate(nb_tumour_rna = n_distinct(tumour_id)) %>% 
+  dplyr::select(rna_ids, muttype_nostrand, effect,nb_tumour_rna, present_normal) %>% 
+  mutate(present_normal = as.character(any(present_normal))) %>% 
+  distinct() %>% 
+  column_to_rownames(var = "rna_ids")
+
+
+pheatmap(data_hla1_pivot, annotation_row = rna_col, 
+         annotation_col = hla_col, show_colnames = FALSE, show_rownames = FALSE,drop_levels = TRUE,
+         main = "RNA editing events by HLA allele types (Proportion)")
+
+```
+
+# Chisq test to Look for the association between HLA allele type and RNA editing events 
+## Chisq test1 (whether specific RNA editing event is negatively associated for particular HLA allele type)
+```{r}
+# Calculate the no. of tumour samples carry specific hla_allele_type, and the no. of tumour samples with specific hla_allele_type and rna_editing events 
+merged_data_nb <- merged_data %>% 
+  group_by(hla_allele_type) %>% mutate(total = n_distinct(tumour_id)) %>% 
+  group_by(rna_ids, hla_allele_type, hla_type) %>% mutate(nb_rna_hla = n_distinct(tumour_id)) %>% select(rna_ids, hla_allele_type, hla_type, total, nb_rna_hla) %>% distinct()
+
+# Chi-square test to compare the distribution of two datasets (check if observed frequencies matched expected frequencies)
+  # Here we compare the distribution between nb_tumour at specific hla_allele that carry specific rna_editing events and nb_tumour at specific hla_allele 
+  # By default, we expect the more nb_tumour we see at specific hla_allele, the more nb_tumour carry specific rna_editing events to be detected. 
+
+chi_square_results <- merged_data_nb %>% group_by(rna_ids, hla_type) %>% 
+  summarize(pval = chisq.test(matrix(c(nb_rna_hla, total - nb_rna_hla), ncol = 2))$p.value)
+
+chi_square_results$padj <- p.adjust(chi_square_results$pval, method= "BH")
+chi_square_results %>% filter(padj < 0.05)
+
+dim(unique(chi_square_results_filtered[c("rna_ids","hla_type")]))
+#write.table(significant, file="significant_rna_editing_hla_allele.csv", sep= ",")
+```
+## Chisq test2 (whether specific HLA allele type is negatively associated with particular RNA editing event) 
+```{r}
+# Calculate the no. of tumour samples carry specific hla_allele_type, and the no. of tumour samples with specific hla_allele_type and rna_editing events 
+merged_data_nb <- merged_data %>% 
+  group_by(rna_ids) %>% mutate(total = n_distinct(tumour_id)) %>% 
+  group_by(rna_ids, hla_allele_type, hla_type,muttype_nostrand) %>% mutate(nb_rna_hla = n_distinct(tumour_id)) %>% select(rna_ids, hla_allele_type, hla_type, total, nb_rna_hla) %>% distinct()
+
+# Chi-square test to compare the distribution of two datasets (check if observed frequencies matched expected frequencies)
+  # Here we compare the distribution between nb_tumour at specific hla_allele that carry specific rna_editing events and nb_tumour at specific hla_allele 
+  # By default, we expect the more nb_tumour we see at specific hla_allele, the more nb_tumour carry specific rna_editing events to be detected. 
+chi_square_results <- merged_data_nb %>% group_by(hla_allele_type, muttype_nostrand) %>% 
+  summarize(pval = chisq.test(matrix(c(nb_rna_hla, total - nb_rna_hla), ncol = 2))$p.value)
+
+chi_square_results$padj <- p.adjust(chi_square_results$pval, method= "BH")
+chi_square_results %>% filter(padj < 0.05) %>% 
+
+dim(unique(chi_square_results_filtered[c("rna_ids","hla_type")]))
+#write.table(significant, file="significant_rna_editing_hla_allele.csv", sep= ",")
+```
+
+# Data shuffling + Chisq test (no significant results)
+```{r}
+# Combination of HLA-allele type and RNA editing events
+# Shuffling the HLA-allele type -- disrupt the link between RNA editing and HLA-allele (data shuffling for 100 times --save each dataframe) 
+# Get random distribution of RNA editing events -- compare with observed distribution (chi-square test)
+
+# Data randomization
+set.seed(123)
+test <- merged_data %>% filter(!is.na(tumour_id)) %>% select("rna_ids", "muttype_nostrand", "patient_region","tumour_id", "hla_type", "allele","hla_allele_type") %>% distinct()
+
+data_shuffling <- data.frame()
+for (i in 1:100) {
+  print(paste0("Data shuffling for ",i, " time!"))
+  test$hla_allele_type <- sample(test$hla_allele_type,replace = FALSE, prob = NULL)
+  
+  data <- test %>% 
+    group_by(rna_ids, hla_allele_type) %>% 
+    summarize(nb_tumour = n_distinct(tumour_id))
+  
+  data_shuffling <- rbind(data_shuffling, data)
+}
+
+# Calculate the median nb_tumour and do the chi-squared test
+data_shuffling_median <- data_shuffling %>% 
+  group_by(rna_ids, hla_allele_type) %>% 
+  summarize(nb_tumour_median = median(nb_tumour)) 
+
+# Create the matrix
+hla_class1 <- merged_data2 %>% 
+  filter(!is.na(tumour_id), hla_type == "A"|hla_type == "B"|hla_type == "C")
+
+hla_class1_nb <- hla_class1 %>% 
+  group_by(hla_allele_type, hla_type, rna_ids) %>% 
+  summarize(nb_tumour = n_distinct(tumour_id))
+
+test3 <- left_join(hla_class1_nb, data_shuffling_median)
+test3[is.na(test3)] <- 0
+
+chi_square_results <- 
+  test3 %>% group_by(rna_ids, hla_type) %>% 
+  summarize(pval = chisq.test(matrix(c(nb_tumour, nb_tumour_median), ncol = 2))$p.value)
+
+chi_square_results$padj <- p.adjust(chi_square_results$pval, method = "BH") # no significnat results
+```
+
+# Compare  between hot vs cold: 
+## Chi-square test (1) 比较frequency
+```{r}
+data_nb_pivot <-  merged_data2 %>% filter(!is.na(immune_cat)) %>% 
+  group_by(rna_ids, hla_type, hla_allele_type, immune_cat) %>% 
+  summarize(nb_tumour = n_distinct(patient_region)) %>% 
+  pivot_wider(names_from = immune_cat, values_from = nb_tumour)
+
+data_nb_pivot$cold[which(is.na(data_nb_pivot$cold))] <- 0
+data_nb_pivot$hot[which(is.na(data_nb_pivot$hot))] <- 0 
+
+chi_square_results <- data_nb_pivot %>% group_by(rna_ids, hla_type) %>%
+  summarize(pval = chisq.test(matrix(c(cold, hot), ncol = 2))$p.value) 
+
+chi_square_results$padj <- p.adjust(chi_square_results$pval, method = "BH")
+
+significant <- chi_square_results %>% filter(padj < 0.05)
+# 18 for tumour_id
+# 246 for patient_regions without filtering by RNA editing co-exits in hot & cold 
+# 113 for patient_regions with filtering 
+sig_results_imm_cat <- inner_join(merged_data2, significant) 
+```
+
+## Chi-square test (2) 比较proportion
+```{r}
+# Proportion = no. of tumour regions with specific RNA_HLA allele combination/ no. of tumour regions as hot / cold 
+data_proportion_pivot <-  merged_data %>% filter(!is.na(immune_cat)) %>% group_by(immune_cat) %>%
+  mutate(total.immune_cat = n_distinct(patient_region)) %>% 
+  group_by(rna_ids, hla_type, hla_allele_type, immune_cat) %>% 
+  summarize(proportion = n_distinct(patient_region)/total.immune_cat) %>% distinct() %>% 
+  pivot_wider(names_from = immune_cat, values_from = proportion)
+  
+data_proportion_pivot$cold[which(is.na(data_proportion_pivot$cold))] <- 0
+data_proportion_pivot$hot[which(is.na(data_proportion_pivot$hot))] <- 0 
+
+chi_square_results <- data_proportion_pivot %>% group_by(hla_type) %>%
+  summarize(pval = chisq.test(matrix(c(cold, hot), ncol = 2))$p.value) 
+
+chi_square_results$padj <- p.adjust(chi_square_results$pval, method = "BH")
+
+significant <- chi_square_results %>% filter(padj < 0.05)
+
+# 0 for proportion 
+sig_results_imm_cat <- inner_join(merged_data2, significant) 
+
+# Plotting 
+merged_data %>% filter(!is.na(immune_cat),!is.na(feature)) %>% group_by(immune_cat) %>% 
+  mutate(total.immune_cat = n_distinct(patient_region)) %>% 
+  group_by(rna_ids, hla_type, combine, hla_allele_type, immune_cat) %>% 
+  summarize(proportion = n_distinct(patient_region)/total.immune_cat) %>% distinct() %>% ggplot(aes(x= immune_cat, y= log10(proportion), fill = immune_cat)) + geom_boxplot() + stat_compare_means()
+```
+
+## Paired boxplot
+```{r}
+# Data -- filter out non-synonymous RNA editing events in tumour samples which appears in both hot and cold regions
+data <- sig_results_imm_cat %>% 
+  filter(!is.na(tumour_id),!is.na(immune_cat)) %>% 
+  group_by(rna_ids, hla_allele_type) %>% mutate(nb_imm_cat = n_distinct(immune_cat)) %>% 
+  filter(nb_imm_cat > 1) %>% 
+  select(rna_ids, hla_allele_type, combine,tumour_id, patient_region, hla_type,immune_cat) %>% 
+  distinct()
+
+# Calculate by tumour_id 
+data_tumour_proportion <- data %>% group_by(hla_allele_type,immune_cat) %>% 
+  mutate(nb_total = n_distinct(tumour_id)) %>% 
+  group_by(rna_ids, hla_allele_type, hla_type, combine, immune_cat) %>% mutate(nb_tumour = n_distinct(tumour_id)) %>% 
+  mutate(proportion = nb_tumour / nb_total) %>% distinct()
+
+## Plot by nb_tumour
+data_tumour_proportion %>% filter(hla_type == "A"|hla_type == "B"|hla_type == "C") %>% 
+  ggplot(aes(x = immune_cat, y= log10(nb_tumour) )) + geom_boxplot() + stat_compare_means() +
+  geom_line(aes(group = combine)) + facet_grid(~hla_type)
+
+## Plot by proportion
+data_tumour_proportion %>% filter(hla_type == "A"|hla_type == "B"|hla_type == "C") %>% 
+  ggplot(aes(x = immune_cat, y= proportion )) + geom_boxplot() + stat_compare_means() + geom_line(aes(group = combine)) + facet_grid(~hla_type)
+
+# filter out cold > hot 
+data_tumour_proportion %>% select(rna_ids, hla_allele_type, combine, hla_type, immune_cat, proportion) %>% distinct() %>%  pivot_wider(names_from = immune_cat, values_from= proportion) %>% filter(cold > hot) %>% pivot_longer(c(hot, cold), names_to = "immune_cat", values_to = "proportion") %>% 
+  filter(hla_type == "A"|hla_type == "B"|hla_type == "C") %>% 
+  ggplot(aes(x = immune_cat, y= proportion )) + geom_boxplot() + stat_compare_means(paired = TRUE) + geom_line(aes(group = combine)) + facet_grid(~hla_type)
+
+# Calculate by patient region 
+data_region_proportion <- data %>% group_by(hla_allele_type,immune_cat) %>% mutate(nb_total = n_distinct(patient_region)) %>% 
+  group_by(rna_ids, hla_allele_type, immune_cat) %>% mutate(nb_region = n_distinct(patient_region)) %>% 
+  mutate(proportion = nb_region / nb_total) %>% distinct()
+
+## Plot by nb_region
+data_region_proportion %>% ggplot(aes(x = immune_cat, y= log10(nb_region) )) + geom_boxplot() + stat_compare_means() + geom_line(aes(group = combine))
+## Plot by proportion
+data_region_proportion %>% ggplot(aes(x = immune_cat, y= proportion )) + geom_boxplot() + stat_compare_means(paired=TRUE) + geom_line(aes(group = rna_ids)) + geom_line(aes(group = combine))
+```
+
+## Heatmap by hot vs cold region (by proportion)
+```{r}
+# Heatmap by cold and hot tumours (HLA class I & nonsynonymous editing events) -- quantified by patient_regions 
+
+  # Create the matrix 
+hla_class1_nonsyn_sig <- sig_results_imm_cat %>% 
+  filter(!is.na(tumour_id), !is.na(immune_cat), hla_type == "A"|hla_type == "B"|hla_type == "C", effect == "nonsynonymous") 
+
+hla_class1_percent <- hla_class1_nonsyn_sig %>% 
+  group_by(hla_allele_type) %>% mutate(nb_total = n_distinct(patient_region)) %>%
+  group_by(rna_ids, hla_allele_type, immune_cat) %>% summarize(nb = n_distinct(patient_region), proportion = n_distinct(patient_region)/nb_total) %>% distinct()
+
+hot <- hla_class1_percent %>% filter(immune_cat == "hot")
+cold <- hla_class1_percent %>% filter(immune_cat == "cold")
+
+hot_pivot <- hot %>% 
+  pivot_wider(names_from = hla_allele_type , values_from = proportion) %>% 
+  column_to_rownames(var= "rna_ids")
+
+hot_pivot[is.na(hot_pivot)] <- 0
+hot_pivot$immune_cat <- NULL
+
+cold_pivot <- cold %>% 
+  select(hla_allele_type, rna_ids, proportion) %>% 
+  pivot_wider(names_from = hla_allele_type , values_from = proportion) %>% 
+  column_to_rownames(var= "rna_ids")
+
+cold_pivot[is.na(cold_pivot)] <- 0
+cold_pivot$immune_cat <- NULL
+  
+  # Annotation
+    # HLA_types 
+hla_col <- hla_class1_nonsyn_sig %>% ungroup() %>% group_by(hla_allele_type) %>% 
+  mutate(nb_hla_region = n_distinct(patient_region)) %>% 
+  select(hla_allele_type, hla_type,nb_hla_region) %>% distinct() %>% 
+  column_to_rownames(var = "hla_allele_type")
+
+# Rna_ids --> muttype_nostrand, effect2 
+rna_col <- hla_class1_nonsyn_sig %>% 
+  group_by(rna_ids) %>% 
+  mutate(nb_tumour_rna = n_distinct(patient_region)) %>% 
+  dplyr::select(rna_ids, muttype_nostrand, effect,nb_tumour_rna, present_normal) %>% 
+  mutate(present_normal = as.character(any(present_normal))) %>% 
+  distinct() %>% 
+  column_to_rownames(var = "rna_ids")
+
+pheatmap(hot_pivot, annotation_row = rna_col, 
+         annotation_col = hla_col, show_colnames = FALSE, show_rownames = FALSE,drop_levels = TRUE,
+         main = "RNA editing events by HLA allele types (Hot_proportion)")
+
+pheatmap(cold_pivot, annotation_row = rna_col, 
+         annotation_col = hla_col, show_colnames = FALSE, show_rownames = FALSE,drop_levels = TRUE,
+         main = "RNA editing events by HLA allele types (Cold_proportion)")
+
+# Boxplot
+ggplot(hla_class1_percent, aes(x = immune_cat, y = proportion, color = immune_cat)) +
+  geom_boxplot(outlier.colour = NA) + geom_point(position = position_jitterdodge(jitter.width = 0.2)) + 
+  stat_compare_means(method ="t.test", label.y = 1.2, label.x = 1.2, label = "p.format")
+```
+## Heatmap by hot vs cold (actual counts of patient region)
+```{r}
+# Heatmap by cold and hot tumours (HLA class I & nonsynonymous editing events) -- quantified by patient_regions 
+
+  # Create the matrix 
+hla_class1_nonsyn_sig <- sig_results_imm_cat %>% 
+  filter(!is.na(tumour_id), !is.na(immune_cat), hla_type == "A"|hla_type == "B"|hla_type == "C", effect == "nonsynonymous") 
+
+hla_class1_region <- hla_class1_nonsyn_sig %>% 
+  group_by(rna_ids, hla_allele_type, immune_cat) %>% summarize(nb_region = n_distinct(patient_region)) 
+
+hot <- hla_class1_region %>% filter(immune_cat == "hot")
+cold <- hla_class1_region %>% filter(immune_cat == "cold")
+
+hot_pivot <- hot %>% 
+  pivot_wider(names_from = hla_allele_type , values_from = nb_region) %>% distinct() %>% 
+  column_to_rownames(var= "rna_ids")
+
+hot_pivot[is.na(hot_pivot)] <- 0
+hot_pivot$immune_cat <- NULL
+
+cold_pivot <- cold %>% 
+  select(hla_allele_type, rna_ids, nb_region) %>% 
+  pivot_wider(names_from = hla_allele_type , values_from = nb_region) %>% 
+  column_to_rownames(var= "rna_ids")
+
+cold_pivot[is.na(cold_pivot)] <- 0
+cold_pivot$immune_cat <- NULL
+  
+  # Annotation
+    # HLA_types 
+hla_col <- hla_class1_nonsyn_sig %>% ungroup() %>% group_by(hla_allele_type) %>% 
+  mutate(nb_hla_region = n_distinct(patient_region)) %>% 
+  select(hla_allele_type, hla_type,nb_hla_region) %>% distinct() %>% 
+  column_to_rownames(var = "hla_allele_type")
+
+# Rna_ids --> muttype_nostrand, effect2 
+rna_col <- hla_class1_nonsyn_sig %>% 
+  group_by(rna_ids) %>% 
+  mutate(nb_tumour_rna = n_distinct(patient_region)) %>% 
+  dplyr::select(rna_ids, muttype_nostrand, effect,nb_tumour_rna, present_normal) %>% 
+  mutate(present_normal = as.character(any(present_normal))) %>% 
+  distinct() %>% 
+  column_to_rownames(var = "rna_ids")
+
+breaksList = seq(0, 200)
+pheatmap(hot_pivot, annotation_row = rna_col, 
+         annotation_col = hla_col, show_colnames = FALSE, show_rownames = FALSE,drop_levels = TRUE,
+         main = "RNA editing events by HLA allele types (Hot_Frequency)", 
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(length(breaksList)), breaks = breaksList)
+
+pheatmap(cold_pivot, annotation_row = rna_col, 
+         annotation_col = hla_col, show_colnames = FALSE, show_rownames = FALSE,drop_levels = TRUE,
+         main = "RNA editing events by HLA allele types (Cold_Frequency)",
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(length(breaksList)), breaks = breaksList)
+
+# Boxplot
+ggplot(hla_class1_region, aes(x = immune_cat, y = log10(nb_region), color = immune_cat)) +
+  geom_boxplot(outlier.colour = NA) + geom_point(position = position_jitterdodge(jitter.width = 0.2)) + 
+  stat_compare_means(method ="t.test", label.y = 1.2, label.x = 1.2, label = "p.format")
+
+```
+
+```{r}
+# merged_data2 contain only tumour samples and nonsynonymous RNA editing events 
+# Count the no of tumours per rna_ids, per hla_allele_type by immune_cat
+
+data <- merged_data %>% 
+  filter(!is.na(tumour_id), effect == "nonsynonymous", !is.na(immune_cat)) %>% 
+  select(rna_ids, hla_allele_type, tumour_id, patient_region, muttype_nostrand, hla_type,immune_cat) %>% 
+  distinct()
+
+data <- data %>% 
+  group_by(rna_ids, hla_allele_type, immune_cat) %>% 
+  summarize(nb = n_distinct(tumour_id))
+
+data %>% ggplot(aes(x = immune_cat, y = log10(nb))) + geom_boxplot() + geom_point() + stat_compare_means()
+
+merged_data2_nb_pivot <- merged_data2_nb_imm %>% 
+  pivot_wider(names_from = immune_cat, values_from = nb)
+
+merged_data2_nb_pivot$cold[which(is.na(merged_data2_nb_pivot$cold))] <- 0 
+merged_data2_nb_pivot$hot[which(is.na(merged_data2_nb_pivot$hot))] <- 0 
+
+hla_type <- merged_data2 %>% dplyr::select(rna_ids, hla_type, hla_allele_type)
+merged_data2_nb_pivot2 <- inner_join(merged_data2_nb_pivot, hla_type) %>% distinct()
+
+# Chi-square test 
+chi_square_results <- merged_data2_nb_pivot2 %>% group_by(rna_ids, hla_type) %>%
+  summarize(pval = chisq.test(matrix(c(cold, hot), ncol = 2))$p.value) 
+
+chi_square_results$padj <- p.adjust(chi_square_results$pval, method = "BH")
+
+significant <- chi_square_results %>% filter(padj < 0.05)
+
+sig_results <- inner_join(merged_data2, significant)
+
+merged_data2_nb_pivot2 %>% select(rna_ids, hla_allele_type, hla_type, cold, hot)
+
+
+
+
+
+
+
+
+
+
+imm_infiltrate %>% group_by(patient_region) %>% mutate(nb = n_distinct(immune_cat)) %>% filter(nb > 1) %>% select(patient_region, immune_cat) %>% distinct()
+
+
+# Compare the number of unique RNA editing events between hot and cold (TRUE and FALSE)
+test %>% filter(!is.na(tumour_id), !is.na(purity), effect == "nonsynonymous", !is.na(immune_cat)) %>% group_by(patient_region, neoantigen, immune_cat) %>% mutate(nb_rna_editing = n_distinct(rna_ids)) %>% ggplot(aes(x = immune_cat, y = nb_rna_editing, color= neoantigen)) + geom_boxplot()
+
+
+merged_data_mhc1 %>% filter(!is.na(tumour_id), effect == "nonsynonymous", !is.na(immune_cat)) %>% group_by(patient,immune_cat) %>% mutate(nb_rna_editing = n_distinct(rna_ids)) %>% ggplot(aes(x = immune_cat, y = nb_rna_editing)) + geom_boxplot() + geom_point(position = position_jitter(seed = 1, width = 0.2)) + stat_compare_means(label.x = 1.3) 
+
+merged_data_mhc1 %>% filter(!is.na(tumour_id), effect == "nonsynonymous", !is.na(immune_cat)) %>% group_by(patient,immune_cat) %>% mutate(nb_rna_editing = n_distinct(rna_ids)) %>% ggplot(aes(x = immune_cat, y = nb_rna_editing)) + geom_boxplot() + geom_point(position = position_jitter(seed = 1, width = 0.2)) + stat_compare_means(label.x = 1.3) 
+
+merged_data_mhc1 %>% filter(!is.na(tumour_id), effect == "nonsynonymous", !is.na(immune_cat)) %>% group_by(immune_cat) %>% mutate(nb_patient = n_distinct(patient)) %>% select(immune_cat, nb_patient) %>% distinct()
+
+test %>% filter(!is.na(tumour_id), !is.na(purity), effect == "nonsynonymous", !is.na(immune_cat), neoantigen == "TRUE") %>% group_by(patient_region, immune_cat) %>% mutate(nb_rna_editing = n_distinct(rna_ids)) %>% ggplot(aes(x = immune_cat, y = nb_rna_editing, color= neoantigen)) + geom_boxplot() + geom_point()
+
+```
+```{r}
+
+merged_data %>% filter(!is.na(immune_cat)) %>% group_by(patient_region) %>% mutate(nb = n_distinct(immune_cat)) %>% filter(nb > 1) %>% select(patient_region, immune_cat, nb) %>% distinct() 
+
+
+test <- merged_data %>% select(rna_ids, hla_allele_type)
+
+
+merged_data %>% filter(!is.na(immune_cat)) %>% ggplot(aes(x = immune_cat, y= purity)) + geom_boxplot() + stat_compare_means()
+
+
+merged_data %>% group_by(patient) %>% mutate(nb = n_distinct(sample_type)) %>% filter(nb > 1 ) %>% mutate(nb_cat = n_distinct(immune_cat)) %>% filter(nb_cat == 1) %>% select(patient) %>% distinct()
+
+merged_data %>% filter(!is.na(tumour_id)) %>% group_by(patient ) %>% mutate(nb = n_distinct(tumour_id)) %>% select(patient, tumour_id, nb) %>% distinct()
+```
+```{r}
+# Will the frequency of RNA editing events be different (lower) between those that are neoantigenic (EL_score < 0.05) and those not? 
+merged_data_mhc1$neoantigen <- "TRUE"
+test <- left_join(merged_data2, merged_data_mhc1) %>% distinct()
+table(test$neoantigen)
+test$neoantigen[which(is.na(test$neoantigen))] <- "FALSE"
+
+test %>% filter(!is.na(tumour_id), !is.na(purity),hla_type == "C", effect == "nonsynonymous") %>% 
+  group_by(rna_ids, hla_allele_type) %>% mutate(nb_tumour = n_distinct(tumour_id)) %>% 
+  ggplot(aes(x = rna_ids, y = hla_allele_type, size = nb_tumour, color = neoantigen)) + geom_point(alpha = .6) + 
+  theme(axis.text.x = element_text(angle = 90,  vjust = 0.5, hjust=1), 
+        plot.title = element_text(hjust = 0.5)) 
+
+# Compare rna editing frequency between hot and cold regions 
+merged_data_mhc1 %>% group_by(rna_ids, hla_allele_type, immune_cat) %>% mutate(nb_tumour = n_distinct(tumour_id)) %>% 
+  filter(!is.na(tumour_id),hla_type == "A", effect == "nonsynonymous", !is.na(immune_cat)) %>% 
+  ggplot(aes(x = rna_ids, y = hla_allele_type, size = nb_tumour, color = immune_cat)) + geom_point(alpha = .6) + theme(axis.text.x = element_text(angle = 90,  vjust = 0.5, hjust=1), 
+        plot.title = element_text(hjust = 0.5)) 
+```
+
+## Data exploration (5)
+```{r}
+# Filtered by EL_score < 0.05, cold vs hot chisq test pval < 0.05 -- compare the frequency of combination (nb_tumour)
+sig_results_imm_cat %>% filter(!is.na(immune_cat), EL_score < 0.05) %>% group_by(rna_ids, hla_allele_type, immune_cat) %>% mutate(nb_tumour = n_distinct(patient_region)) %>% ggplot(aes(x= immune_cat, y = nb_tumour)) + geom_boxplot() + geom_point() + geom_line(aes(group = combine)) + stat_compare_means(paired = TRUE, label.x = 1.3)
+
+sig_results_imm_cat %>% filter(!is.na(immune_cat), EL_score < 0.05) %>% group_by(hla_allele_type) %>% mutate(total_nb = n_distinct(tumour_id)) %>% group_by(rna_ids, hla_allele_type, immune_cat) %>% mutate(nb_tumour = n_distinct(tumour_id)) %>% mutate(proportion = nb_tumour / total_nb) %>% select(rna_ids, hla_allele_type, immune_cat, symbol,combine, proportion) %>% distinct() %>% pivot_wider(names_from= immune_cat, values_from = proportion) %>% filter(hot > cold)
+
+# Filter by nb_tumour > 3
+sig_results_imm_cat %>% filter(!is.na(immune_cat), EL_score < 0.05) %>% group_by(rna_ids, hla_allele_type) %>% mutate(nb = n_distinct(tumour_id)) %>% filter(nb > 3) %>% group_by(hla_allele_type) %>% mutate(total_nb = n_distinct(tumour_id)) %>% group_by(rna_ids, hla_allele_type, immune_cat) %>% mutate(nb_tumour = n_distinct(tumour_id)) %>% mutate(proportion = nb_tumour / total_nb) %>% select(rna_ids, hla_allele_type, immune_cat, symbol,combine, proportion) %>% distinct() %>% ggplot(aes(x= immune_cat, y = proportion)) + geom_boxplot() + geom_point() + geom_line(aes(group = combine)) + stat_compare_means(paired = TRUE,label.x = 1.3)
+
+
+# Compare the binding affinity between tumour-specific and non-specific  
+sig_results_imm_cat %>% filter(!is.na(feature)) %>% select(rna_ids, hla_allele_type,combine, EL_score, feature) %>% distinct() %>% ggplot(aes(x= feature, y = log10(EL_score))) + geom_boxplot() + geom_point()  + stat_compare_means(label.x = 1.3)
+
+merged_data %>% filter(!is.na(feature), effect == "nonsynonymous") %>% select(rna_ids, hla_allele_type,combine, EL_score, feature) %>% distinct() %>% ggplot(aes(x= feature, y = log10(EL_score))) + geom_boxplot() + geom_point()  + stat_compare_means(label.x = 1.3)
+
+# Compare the number of neo-antigenic RNA editing events between hot vs cold regions 
+sig_results_imm_cat %>% filter(!is.na(immune_cat), EL_score < 0.05) %>% group_by(immune_cat) %>% summarize(no_rna_ids= n_distinct(combine)) %>% ggplot(aes(x= immune_cat, y= no_rna_ids)) + geom_bar(stat = "identity")
+
+merged_data2 %>% filter(!is.na(immune_cat), EL_score < 0.05) %>% group_by(immune_cat) %>% summarize(no_rna_ids= n_distinct(combine)) %>% ggplot(aes(x= immune_cat, y= no_rna_ids)) + geom_bar(stat = "identity")
+
+```
+
+
+## Chisq test using normal tissues 
+```{r}
+# Attribute normal tissues as either hot or cold regions based on the no. of tumour ids 
+# 1. filter out patients with both normal and tumour samples
+patients <- merged_data %>% group_by(patient) %>% mutate(nb_sample = n_distinct(sample_type)) %>% filter(nb_sample > 1)
+patients <- unique(patients$patient)
+
+# Assign normal samples as either "hot" or "cold" region based on their corresponding tumour regions
+normal <- merged_data %>% filter(sample_type == "normal") 
+
+comparison <- data.frame()
+for (x in patients){
+  temp <- merged_data %>% filter(patient == x, !is.na(immune_cat)) %>% group_by(patient, immune_cat) %>% summarize(nb = n_distinct(tumour_id)) %>% pivot_wider(names_from = immune_cat, values_from = nb) 
+  
+  comparison <- rbind(comparison,temp)
+}
+comparison$cold[which(is.na(comparison$cold))] <- 0 
+comparison$hot[which(is.na(comparison$hot))] <- 0 
+comparison <- comparison %>% filter(cold != hot) %>% mutate(test = if_else(cold > hot, "cold","hot")) %>% select(patient, test)
+
+normal <- merge(normal, comparison)
+
+# Chisq test to compare the frequency of RNA editing between "hot" vs "cold" in normal samples 
+normal_nb_pivot <- normal %>% group_by(rna_ids, hla_type, hla_allele_type, test) %>% summarize(nb_tumour = n_distinct(patient_region)) %>% pivot_wider(names_from = test, values_from = nb_tumour)
+
+normal_nb_pivot$cold[which(is.na(normal_nb_pivot$cold))] <- 0
+normal_nb_pivot$hot[which(is.na(normal_nb_pivot$hot))] <- 0
+
+chi_square_results2 <- normal_nb_pivot %>% group_by(rna_ids, hla_type) %>%
+  summarize(pval = chisq.test(matrix(c(cold, hot), ncol = 2))$p.value) 
+
+chi_square_results2$padj <- p.adjust(chi_square_results2$pval, method = "BH")
+
+significant2 <- chi_square_results2 %>% filter(padj < 0.05)
+
+normal %>% group_by(rna_ids, hla_allele_type) %>% mutate(nb = n_distinct(test)) %>% filter(nb > 1) %>% group_by(rna_ids, hla_allele_type, immune_cat, test) %>% summarize(nb_region = n_distinct(patient_region)) %>% ggplot(aes(x = test, y = nb_region)) + geom_boxplot() + geom_point() + stat_compare_means()
+```
+
+# Correlation between RNA editing frequency/level with cell type abundance (danaher scores) 
+## Correlation with all RNA editing events (neoantigenic + non-neoantigenic) in all samples 
+```{r}
+# Data import 
+danaher_scores <- read.fst("2022-06-30_danaher_scores.fst")
+danaher_scores <- danaher_scores %>% select(cell_type_title, score, residual, sample_name)
+colnames(danaher_scores)[4] <- "patient_region"
+
+# Calculate the frequency(proportion) and average level of RNA editing 
+rna_data <- merged_data %>% filter(all_cov > 60) %>% group_by(patient_region) %>% summarize(total_rna_editing = n_distinct(rna_ids), average_level = mean(all_vaf)) 
+
+merged_danaher <- inner_join(rna_data, danaher_scores)
+
+# Correlation with danaher scores of each cell type (total RNA editing events)
+result <- merged_danaher %>% 
+  filter(!is.na(cell_type_title)) %>% 
+  group_by(cell_type_title) %>%
+  summarize(cor_coef = as.numeric(cor.test(total_rna_editing, score, method ="spearman")[4]), pval = as.numeric(cor.test(total_rna_editing, score, method = "spearman")[3])) %>% 
+  mutate(padj = p.adjust(pval, method = "BH")) %>% filter(padj < 0.05)
+
+# Scatter plots
+cells <- unique(result$cell_type_title)
+merged_danaher[which(merged_danaher$cell_type_title %in% cells),] %>% ggplot(aes(x = total_rna_editing, y = score)) + geom_point() + geom_smooth(method = lm, se = FALSE) + stat_cor(method = "spearman") + facet_wrap(~ cell_type_title)
+
+# Correlation with danaher scores of each cell type (average RNA editing level)
+result <- merged_danaher %>% 
+  filter(!is.na(cell_type_title)) %>% 
+  group_by(cell_type_title) %>%
+  summarize(cor_coef = as.numeric(cor.test(average_level, score, method ="spearman")[4]), pval = as.numeric(cor.test(average_level, score, method = "spearman")[3])) %>% 
+  mutate(padj = p.adjust(pval, method = "BH")) %>% filter(padj < 0.05)
+
+cells <- unique(result$cell_type_title)
+merged_danaher[which(merged_danaher$cell_type_title %in% cells),] %>% ggplot(aes(x = log10(average_level), y = score)) + geom_point() + geom_smooth(method = lm, se = FALSE) + stat_cor(method = "spearman") + facet_wrap(~ cell_type_title)
+
+#for (x in cells){
+#  title = paste0(x)
+#  p <- merged_danaher %>% filter(cell_type_title == x) %>% ggplot(aes(x = average_level, y = #score)) + geom_point() + geom_smooth(method = lm, se = FALSE) + labs(title = title) + #stat_cor(method = "spearman") 
+#  plot(p)
+#}
+
+```
+
+## Correlation of RNA editing events in tumour or normal samples
+```{r}
+# Correlation with tumour samples 
+
+## Calculate the frequency and average level of RNA editing (tumour samples/ hot regions)
+rna_data <- merged_data %>% filter(!is.na(tumour_id), all_cov > 30, immune_cat == "cold") %>% group_by(patient_region) %>% summarize(total_rna_editing = n_distinct(rna_ids),average_level= mean(all_vaf)) 
+
+merged_danaher <- inner_join(rna_data, danaher_scores)
+
+result <- merged_danaher %>% 
+  group_by(cell_type_title) %>%
+  summarize(cor_coef = as.numeric(cor.test(total_rna_editing, score, method ="spearman")[4]), pval = as.numeric(cor.test(total_rna_editing, score, method = "spearman")[3])) %>% 
+  mutate(padj = p.adjust(pval, method = "BH")) %>% filter(padj < 0.05)
+
+cells <- unique(result$cell_type_title)
+merged_danaher[which(merged_danaher$cell_type_title %in% cells),] %>% ggplot(aes(x = total_rna_editing, y = score)) + geom_point() + geom_smooth(method = lm, se = FALSE) + stat_cor(method = "spearman") + facet_wrap(~cell_type_title)
+
+result <- merged_danaher %>% 
+  group_by(cell_type_title) %>%
+  summarize(cor_coef = as.numeric(cor.test(log10(average_level), score, method ="spearman")[4]), pval = as.numeric(cor.test(average_level, score, method = "spearman")[3])) %>% 
+  mutate(padj = p.adjust(pval, method = "BH")) %>% filter(padj < 0.05)
+
+cells <- unique(result$cell_type_title)
+merged_danaher[which(merged_danaher$cell_type_title %in% cells),] %>% ggplot(aes(x = log10(average_level), y = score)) + geom_point() + geom_smooth(method = lm, se = FALSE) + stat_cor(method = "spearman") + facet_wrap(~cell_type_title)
+
+# Correlation with normal samples 
+## Calculate the frequency and average level of RNA editing 
+rna_data <- merged_data %>% filter(sample_type == "normal", all_cov > 30) %>% group_by(patient_region) %>% summarize(total_rna_editing = n_distinct(rna_ids),average_level= mean(all_vaf)) 
+
+merged_danaher <- inner_join(rna_data, danaher_scores)
+
+result <- merged_danaher %>% 
+  group_by(cell_type_title) %>%
+  summarize(cor_coef = as.numeric(cor.test(total_rna_editing, score, method ="spearman")[4]), pval = as.numeric(cor.test(total_rna_editing, score, method = "spearman")[3])) %>% 
+  mutate(padj = p.adjust(pval, method = "BH")) %>% filter(padj < 0.05)
+
+cells <- unique(result$cell_type_title)
+merged_danaher[which(merged_danaher$cell_type_title %in% cells),] %>% ggplot(aes(x = total_rna_editing, y = score)) + geom_point() + geom_smooth(method = lm, se = FALSE) + stat_cor(method = "spearman") + facet_wrap(~cell_type_title)
+
+result <- merged_danaher %>% 
+  group_by(cell_type_title) %>%
+  summarize(cor_coef = as.numeric(cor.test(average_level, score, method ="spearman")[4]), pval = as.numeric(cor.test(log10(average_level), score, method = "spearman")[3])) %>% 
+  mutate(padj = p.adjust(pval, method = "BH")) %>% filter(padj < 0.05)
+
+cells <- unique(result$cell_type_title)
+merged_danaher[which(merged_danaher$cell_type_title %in% cells),] %>% ggplot(aes(x = average_level, y = score)) + geom_point() + geom_smooth(method = lm, se = FALSE) + stat_cor(method = "spearman") + facet_wrap(~cell_type_title)
+
+```
+## Correlation with the frequency/proportion of neoantigenic RNA editing events
+```{r}
+# Filter RNA editing events with nonsynonymous effect and strong binding affinity 
+# Calculate the number of neoantigenic RNA editing events in each patient region and average editing level  
+rna_data <- merged_data %>% filter(!is.na(tumour_id), all_cov > 30, immune_cat == "cold",effect == "nonsynonymous", EL_score < 0.05) %>% group_by(patient_region) %>% summarize(total_rna_editing = n_distinct(rna_ids), average_level = mean(all_vaf)) 
+
+rna_data_proportion <- merged_data %>% filter(!is.na(tumour_id), all_cov > 30, immune_cat == "hot") %>% group_by(patient_region) %>% mutate(total = n_distinct(rna_ids)) %>% filter(effect == "nonsynonymous", EL_score < 0.05) %>% group_by(patient_region) %>% summarize(proportion = n_distinct(rna_ids)/total, average_level = mean(all_vaf)) %>% distinct()
+
+merged_danaher <- inner_join(rna_data, danaher_scores)
+merged_danaher_proportion <- inner_join(rna_data_proportion, danaher_scores)
+
+# Correlation between frequency of neo-antigenic RNA editing events and danaher scores
+result <- merged_danaher %>% 
+  group_by(cell_type_title) %>%
+  summarize(cor_coef = as.numeric(cor.test(total_rna_editing, score, method ="spearman")[4]), 
+            pval = as.numeric( cor.test(total_rna_editing, score, method = "spearman")[3])) %>% 
+  mutate(padj = p.adjust(pval, method = "BH")) %>% filter(padj < 0.05)
+
+cells <- unique(result$cell_type_title)
+merged_danaher[which(merged_danaher$cell_type_title %in% cells),] %>% ggplot(aes(x = total_rna_editing, y = score)) + geom_point() + geom_smooth(method = lm, se = FALSE) + stat_cor(method = "spearman") + facet_wrap(~cell_type_title)
+
+# Correlation between average RNA editing level and danaher scores 
+result <- merged_danaher %>% 
+  group_by(cell_type_title) %>%
+  summarize(cor_coef = as.numeric(cor.test(average_level, score, method ="spearman")[4]), 
+            pval = as.numeric(cor.test(average_level, score, method = "spearman")[3])) %>% 
+  mutate(padj = p.adjust(pval, method = "BH")) %>% filter(padj < 0.05)
+
+cells <- unique(result$cell_type_title)
+merged_danaher[which(merged_danaher$cell_type_title %in% cells),] %>% ggplot(aes(x = average_level, y = score)) + geom_point() + geom_smooth(method = lm, se = FALSE) + stat_cor(method = "spearman") + facet_wrap(~cell_type_title)
+
+#for (x in cells){
+#  title = paste0(x)
+#  p <- merged_danaher %>% filter(cell_type_title == x) %>% ggplot(aes(x = average_level, y = score)) + #geom_point() + geom_smooth(method = lm, se = FALSE) + labs(title = title) + stat_cor(method = "spearman") 
+#  plot(p)
+#}
+
+# Correlation between frequency of neo-antigenic RNA editing events and danaher scores
+result <- merged_danaher_proportion %>% 
+  group_by(cell_type_title) %>%
+  summarize(cor_coef = as.numeric(cor.test(proportion, score, method ="spearman")[4]), 
+            pval = as.numeric( cor.test(proportion , score, method = "spearman")[3])) %>% 
+  mutate(padj = p.adjust(pval, method = "BH")) %>% filter(padj < 0.05)
+
+cells <- unique(result$cell_type_title)
+merged_danaher_proportion[which(merged_danaher_proportion$cell_type_title %in% cells),] %>% ggplot(aes(x = proportion, y = score)) + geom_point() + geom_smooth(method = lm, se = FALSE) + stat_cor(method = "spearman") + facet_wrap(~cell_type_title)
+
+# Correlation between average RNA editing level and danaher scores 
+result <- merged_danaher_proportion %>% 
+  group_by(cell_type_title) %>%
+  summarize(cor_coef = as.numeric(cor.test(average_level, score, method ="spearman")[4]), 
+            pval = as.numeric(cor.test(average_level, score, method = "spearman")[3])) %>% 
+  mutate(padj = p.adjust(pval, method = "BH")) %>% filter(padj < 0.05)
+
+cells <- unique(result$cell_type_title)
+merged_danaher_proportion[which(merged_danaher_proportion$cell_type_title %in% cells),] %>% ggplot(aes(x = average_level, y = score)) + geom_point() + geom_smooth(method = lm, se = FALSE) + stat_cor(method = "spearman") + facet_wrap(~cell_type_title)
+
+```
+## Correlation between purity and total RNA editing events/RNA editing level 
+```{r}
+# Frequency of all RNA editing events with all_cov >30 
+merged_data %>% filter(!is.na(tumour_id), all_cov > 30) %>% group_by(patient_region, purity) %>% summarize(total_rna_editing_events = n_distinct(rna_ids)) %>% ggplot(aes(x = total_rna_editing_events, y = purity)) + geom_point() + geom_smooth(method = lm, se = FALSE) + labs(title = "Correlation between purity and total RNA editing events per patient region") + stat_cor(method = "spearman") 
+
+# average RNA editing level
+merged_data %>% filter(!is.na(tumour_id), all_cov > 30) %>% group_by(patient_region, purity) %>% summarize(total_rna_editing_events = n_distinct(rna_ids), rna_editing_level = mean(all_vaf)) %>% ggplot(aes(x = rna_editing_level, y = purity)) + geom_point() + geom_smooth(method = lm, se = FALSE) + labs(title = "Correlation between purity and average RNA editing level per patient region") + stat_cor(method = "spearman") 
+
+# Neo-antigenic RNA editing events 
+## Frequency 
+merged_data %>% filter(!is.na(tumour_id), all_cov > 30,effect == "nonsynonymous", EL_score < 0.05) %>% group_by(patient_region, purity) %>% summarize(total_neoantigenic = n_distinct(rna_ids)) %>% ggplot(aes(x = total_neoantigenic, y = purity)) + geom_point() + geom_smooth(method = lm, se = FALSE) + labs(title = "Correlation between purity and frequency of neoantigenic RNA editing events per patient region") + stat_cor(method = "spearman") 
+
+## Average level
+merged_data %>% filter(!is.na(tumour_id), all_cov > 30,effect == "nonsynonymous", EL_score < 0.05) %>% group_by(patient_region, purity) %>% summarize(average_level = mean(all_vaf)) %>% ggplot(aes(x = average_level, y = purity)) + geom_point() + geom_smooth(method = lm, se = FALSE) + labs(title = "Correlation between purity and average RNA editing level per patient region") + stat_cor(method = "spearman") 
+
+## Proportion
+merged_data %>% filter(!is.na(tumour_id), all_cov > 30) %>% group_by(patient_region) %>% mutate(total = n_distinct(rna_ids)) %>% filter(effect == "nonsynonymous", EL_score < 0.05) %>% group_by(patient_region, purity) %>% summarize(proportion = n_distinct(rna_ids)/total) %>% ggplot(aes(x = proportion, y = purity)) + geom_point() + geom_smooth(method = lm, se = FALSE) + labs(title = "Correlation between purity and proportion of neoantigenic RNA editing events per patient region") + stat_cor(method = "spearman") 
+
+```
+# Compare the frequency of RNA editing events between primary and meta tumour samples
+```{r}
+# All RNA editing events 
+merged_data %>% filter(!is.na(tumour_id), all_cov > 30) %>% group_by(patient_region, status) %>% 
+  summarize(total_rna_editing = n_distinct(rna_ids), average_level = mean(all_vaf)) %>% 
+  ggplot(aes(x = status, y = total_rna_editing)) + geom_jitter() + geom_boxplot()  + stat_compare_means()
+
+merged_data %>% filter(!is.na(tumour_id), all_cov > 30) %>% group_by(patient_region, status) %>% 
+  summarize(total_rna_editing = n_distinct(rna_ids), average_level = mean(all_vaf)) %>% 
+  ggplot(aes(x = status, y = average_level)) + geom_jitter() + geom_boxplot() + stat_compare_means()
+
+merged_data %>% filter(!is.na(tumour_id), all_cov > 30, !is.na(EL_score)) %>% group_by(patient_region, status) %>% 
+  summarize(average_binding_affinity = mean(EL_score)) %>% 
+  ggplot(aes(x = status, y = average_binding_affinity)) + geom_jitter() + geom_boxplot() + stat_compare_means()
+
+# Neoantigenic RNA editing events 
+merged_data %>% filter(!is.na(tumour_id), all_cov > 30) %>% group_by(patient_region, status) %>% 
+  mutate(total_rna_editing = n_distinct(rna_ids)) %>% filter(effect == "nonsynonymous",EL_score < 0.1) %>% group_by(patient_region, status) %>% summarize(proportion = n_distinct(rna_ids)/ total_rna_editing) %>% distinct() %>% ggplot(aes(x = status, y = proportion)) + geom_jitter() + geom_boxplot() + stat_compare_means()
+
+merged_data %>% filter(!is.na(tumour_id), all_cov > 30) %>% 
+  filter(effect == "nonsynonymous",EL_score < 0.1) %>% group_by(patient_region, status) %>% 
+  summarize(total_rna_editing = n_distinct(rna_ids), average_level = mean(all_vaf)) %>% distinct() %>% ggplot(aes(x = status, y = average_level)) + geom_jitter()  + geom_boxplot() + stat_compare_means()
+
+merged_data %>% filter(!is.na(tumour_id), all_cov > 30) %>% 
+  filter(effect == "nonsynonymous",EL_score < 0.1) %>% group_by(patient_region, status) %>% 
+  summarize(average_binding_affinity = mean(EL_score)) %>% distinct() %>% ggplot(aes(x = status, y = average_binding_affinity)) + geom_jitter()  + geom_boxplot() + stat_compare_means()
+
+```
+
+# Compare the RNA editing level and binding affinity between hot vs cold, tumour-specific vs non-specific  
+```{r}
+DEanalysis <- read.table("DEanalysis_results.csv", sep = ",", header = TRUE)
+# filter by absolute value of logFC > 0.1 and adjusted pval < 0.05 
+DEresults <- DEanalysis %>% filter(logFC < -0.1 , adj.P.Val < 0.05 ) 
+DEanalysis$DEresults <- TRUE
+DEanalysis$DEresults[which(DEanalysis$gene_id %in% DEresults$gene_id)] <- FALSE 
+table(DEanalysis$DEresults)
+DEresults <- DEanalysis[,c("gene_id","DEresults")]
+colnames(DEresults)[1] <- "symbol"
+merged_data <- left_join(merged_data, DEresults)
+
+# Compare the RNA editing level between tumour-specific and non-specific 
+data %>% filter(!is.na(feature), feature != "normal-specific", all_cov > 30, effect == "nonsynonymous", EL_score < 0.1, EL_GL_score > EL_score, DEresults == TRUE) %>% group_by(patient) %>% mutate(nb = n_distinct(feature)) %>% filter(nb > 1) %>% group_by(patient, feature) %>% summarize(all_vaf_mean = mean(all_vaf)) %>% distinct() %>% ggplot(aes(x = feature, y = all_vaf_mean)) + geom_boxplot() + geom_point() + geom_line(aes(group = patient)) + stat_compare_means(paired= TRUE) 
+
+# Compare the RNA editing level between hot vs cold patient regions 
+data %>% filter(!is.na(immune_cat), feature != "normal-specific", all_cov > 30, effect == "nonsynonymous", EL_score < 0.1, EL_GL_score > EL_score, DEresults == TRUE) %>% group_by(tumour_id) %>% mutate(nb = n_distinct(immune_cat)) %>% filter(nb > 1) %>% group_by(tumour_id, immune_cat) %>% summarize(all_vaf_mean = mean(all_vaf)) %>% distinct() %>% ggplot(aes(x = immune_cat, y = all_vaf_mean)) + geom_boxplot() + geom_point() + geom_line(aes(group = tumour_id)) + stat_compare_means(paired= TRUE) 
+
+data <- data %>% filter(!is.na(immune_cat))
+data$immune_cat_by_patient <- data$immune_cat
+mixed <- data %>% group_by(patient) %>% summarize(nb = n_distinct(immune_cat)) %>% filter(nb > 1)
+data$immune_cat_by_patient[which(data$patient %in% mixed$patient)] <- "mixed"
+
+data %>% filter(!is.na(feature), feature != "normal-specific", all_cov > 30, effect == "nonsynonymous", EL_score < 0.1, EL_GL_score > EL_score, DEresults == TRUE) %>% group_by(patient) %>% mutate(nb = n_distinct(feature)) %>% filter(nb > 1) %>% group_by(patient, feature, immune_cat_by_patient) %>% summarize(all_vaf_mean = mean(all_vaf)) %>% distinct() %>% ggplot(aes(x = feature, y = all_vaf_mean)) + geom_boxplot()  + geom_line(aes(group = patient)) + stat_compare_means(paired= TRUE) + geom_point(aes(x = feature, y = all_vaf_mean,color = immune_cat_by_patient))
+
+# Compare the binding affinity 
+data %>% filter(!is.na(feature), effect == "nonsynonymous", EL_score < 0.1, EL_GL_score > EL_score, DEresults == TRUE) %>% ggplot(aes(x = immune_cat, y = EL_score, color = immune_cat)) + geom_boxplot() + geom_point() +  stat_compare_means()
+
+data %>% filter(!is.na(feature), feature != "normal-specific", effect == "nonsynonymous", EL_score < 0.1, EL_GL_score > EL_score, DEresults == TRUE) %>% ggplot(aes(x = feature, y = EL_score, color = feature)) + geom_boxplot() + geom_point() +  stat_compare_means()
+
+```
+## Compare the proportion of neo-antigenic RNA editing events between hot vs cold  
+```{r}
+# General frequency of RNA editing events 
+merged_data %>% filter(!is.na(immune_cat)) %>% group_by(immune_cat, patient_region) %>% summarize(total.rna.editing = n_distinct(rna_ids)) %>% ggplot(aes(x = immune_cat, y = total.rna.editing, color = immune_cat)) + geom_boxplot() + geom_point() + stat_compare_means()
+
+data %>% filter(!is.na(immune_cat), feature != "normal-specific", all_cov > 30, effect == "nonsynonymous", EL_score < 0.1, EL_GL_score > EL_score, DEresults == TRUE) %>% group_by(immune_cat, patient_region) %>% summarize(no.neoantigenic.editing = n_distinct(rna_ids)) %>% ggplot(aes(x = immune_cat, y = no.neoantigenic.editing, color = immune_cat)) + geom_boxplot() + geom_point() + stat_compare_means()
+
+data %>% filter(!is.na(immune_cat)) %>% group_by(immune_cat, patient_region) %>% mutate(total.rna.editing = n_distinct(rna_ids)) %>% filter(feature != "normal-specific", all_cov > 30, effect == "nonsynonymous", EL_score < 0.1, EL_GL_score > EL_score, DEresults == TRUE) %>% summarize(proportion = n_distinct(rna_ids)/total.rna.editing) %>% ggplot(aes(x = immune_cat, y = proportion, color = immune_cat)) + geom_boxplot() + geom_point() + stat_compare_means()
+
+test <- data %>% filter(!is.na(immune_cat)) %>% group_by(immune_cat, patient_region) %>% mutate(total.rna.editing = n_distinct(rna_ids)) %>% filter(all_cov > 30, effect == "nonsynonymous", EL_score < 0.1, EL_GL_score > EL_score, DEresults == TRUE)
+
+```
+
+# immune-escape & immuno-editing: relationship between LOHHLA and RNA editing 
+## (1) non-synonymous RNA editing events with all_cov > 30 
+```{r}
+# import data 
+lohhla <- read.fst("2022-07-04_lohhla.fst")
+lohhla_data <- lohhla  %>% filter(wxs_pass == "TRUE") %>% select(sample_name, patient, tumour_id, gene, allele1, allele2,cn1_binned, cn2_binned,loh) %>% distinct()
+
+colnames(lohhla_data) <- c("patient_region","patient","tumour_id","hla_type","allele1","allele2","cn1_binned","cn2_binned", "loh")
+lohhla_data$tumour_id <- paste0(lohhla_data$patient, "_", lohhla_data$tumour_id)
+
+neoantigen_data <-  merged_data %>% filter(effect == "nonsynonymous", EL_score < 0.1, EL_GL_score > EL_score, all_cov > 30) 
+
+# Merge lohhla data with RNA editing data 
+merged_lohhla4 <- inner_join(neoantigen_data, lohhla_data) 
+
+# In general comparison of RNA editing frequency and level between lohhla TRUE vs FALSE 
+freq <- merged_lohhla %>% filter(!is.na(loh),all_cov >30) %>% group_by(patient_region,hla_type, loh) %>% summarize(frequency = n_distinct(rna_ids), mean_editing_level = mean(all_vaf)) %>% ggplot(aes(x = loh, y = frequency, color = loh))   + stat_compare_means()  + geom_jitter() + geom_boxplot() + labs(xlab = "LOHHLA", ylab = "RNA editing frequency", title = "Comparison of RNA editing frequency")
+
+level <- merged_lohhla %>% filter(!is.na(loh),all_cov >30) %>% group_by(patient_region,hla_type, loh) %>% summarize(frequency = n_distinct(rna_ids), mean_editing_level = mean(all_vaf)) %>% ggplot(aes(x = loh, y = mean_editing_level, color = loh))   + stat_compare_means()  + geom_jitter() + geom_boxplot() + labs(xlab = "LOHHLA", ylab = "RNA editing level (average)", title = "Comparison of mean RNA editing level")
+
+ggarrange(freq, level, labels = c("A", "B"),ncol = 2, nrow = 1)
+
+# Relationship between LOHHLA and immune hot/cold regions
+merged_lohhla %>% filter(!is.na(loh), !is.na(immune_cat)) %>% group_by(loh, immune_cat) %>% summarize(no.region = n_distinct(patient_region), no.patient = n_distinct(patient)) 
+
+merged_lohhla %>% filter(!is.na(loh), !is.na(immune_cat)) %>% group_by(loh, immune_cat) %>% summarize(no.region = n_distinct(patient_region)) %>% pivot_wider(names_from = immune_cat, values_from = no.region) %>% summarize(pval = chisq.test(matrix(c(cold, hot), ncol = 2))$p.value) # no significant association 
+
+# LOHHLA in hot regions 
+merged_lohhla %>% filter(!is.na(loh),all_cov >30, immune_cat == "hot") 
+freq <- merged_lohhla %>% filter(!is.na(loh),immune_cat == "cold") %>% group_by(patient_region,hla_type, loh) %>% summarize(frequency = n_distinct(combine), mean_editing_level = mean(all_vaf)) %>% ggplot(aes(x = loh, y = frequency, color = loh))   + stat_compare_means()  + geom_jitter() + geom_boxplot() + labs(xlab = "LOHHLA", ylab = "RNA editing frequency", title = "Comparison of RNA editing frequency(hot)")
+
+level <- merged_lohhla %>% filter(!is.na(loh),all_cov >30, immune_cat == "hot") %>% group_by(patient_region,hla_type, loh) %>% summarize(frequency = n_distinct(combine), mean_editing_level = mean(all_vaf)) %>% ggplot(aes(x = loh, y = mean_editing_level, color = loh))   + stat_compare_means()  + geom_jitter() + geom_boxplot() + labs(xlab = "LOHHLA", ylab = "RNA editing level (average)", title = "Comparison of mean RNA editing level(hot)")
+
+ggarrange(freq, level, labels = c("A", "B"),ncol = 2, nrow = 1)
+
+# LOHHLA in cold regions 
+merged_lohhla %>% filter(!is.na(loh),all_cov >30) %>% filter(immune_cat == "cold") 
+freq <- merged_lohhla %>% filter(!is.na(loh),immune_cat == "cold") %>% group_by(patient_region,hla_type, loh) %>% summarize(frequency = n_distinct(combine), mean_editing_level = mean(all_vaf)) %>% ggplot(aes(x = loh, y = frequency, color = loh))   + stat_compare_means()  + geom_jitter() + geom_boxplot() + labs(xlab = "LOHHLA", ylab = "RNA editing frequency", title = "Comparison of RNA editing frequency(cold)")
+
+level <- merged_lohhla %>% filter(!is.na(loh), all_cov >30,immune_cat == "cold") %>% group_by(patient_region,hla_type, loh) %>% summarize(frequency = n_distinct(combine), mean_editing_level = mean(all_vaf)) %>% ggplot(aes(x = loh, y = mean_editing_level, color = loh))   + stat_compare_means()  + geom_jitter() + geom_boxplot() + labs(xlab = "LOHHLA", ylab = "RNA editing level (average)", title = "Comparison of mean RNA editing level(cold)")
+
+ggarrange(freq, level, labels = c("A", "B"),ncol = 2, nrow = 1)
+```
+
+## (2) non-synonymous RNA editing events with EL_score< 0.05, all_cov > 30 
+```{r}
+# LOHHLA in hot regions 
+freq <- merged_lohhla %>% filter(!is.na(loh),all_cov >30, immune_cat == "hot", EL_score < 0.05) %>% group_by(patient_region,hla_type, loh) %>% summarize(frequency = n_distinct(combine), mean_editing_level = mean(all_vaf)) %>% ggplot(aes(x = loh, y = frequency, color = loh))   + stat_compare_means()  + geom_jitter() + geom_boxplot() + labs(xlab = "LOHHLA", ylab = "RNA editing frequency", title = "Comparison of RNA editing frequency(hot)")
+
+level <- merged_lohhla %>% filter(!is.na(loh),all_cov >30, immune_cat == "hot", EL_score < 0.05) %>% group_by(patient_region,hla_type, loh) %>% summarize(frequency = n_distinct(combine), mean_editing_level = mean(all_vaf)) %>% ggplot(aes(x = loh, y = mean_editing_level, color = loh))   + stat_compare_means()  + geom_jitter() + geom_boxplot() + labs(xlab = "LOHHLA", ylab = "RNA editing level (average)", title = "Comparison of mean RNA editing level(hot)")
+
+ggarrange(freq, level, labels = c("A", "B"),ncol = 2, nrow = 1)
+
+# LOHHLA in hot regions by proportion 
+proportion <- merged_lohhla %>% filter(!is.na(loh),all_cov >30, immune_cat == "hot") %>% group_by(patient_region,hla_type, loh) %>% mutate(total = n_distinct(combine)) %>% filter(EL_score < 0.05) %>% group_by(patient_region, hla_type, loh) %>% summarize(proportion = n_distinct(combine)/total) %>% ggplot(aes(x = loh, y = proportion, color = loh))   + stat_compare_means()  + geom_jitter() + geom_boxplot() + labs(xlab = "LOHHLA", ylab = "RNA editing frequency", title = "Comparison of RNA editing proportion(hot)")
+
+ggarrange(proportion, level, labels = c("A", "B"),ncol = 2, nrow = 1)
+
+# LOHHLA by patient level 
+freq <- merged_lohhla %>% filter(!is.na(loh), all_cov > 30, EL_score < 0.05) %>% group_by(patient) %>% mutate(nb = n_distinct(loh)) %>%  group_by(patient, nb) %>% summarize(frequency = n_distinct(combine),mean_editing_level = mean(all_vaf)) %>% ggplot(aes(x = as.factor(nb), y = frequency, color = as.factor(nb)))  + stat_compare_means() + geom_boxplot() + geom_jitter()  + labs(xlab = "LOHHLA", ylab = "RNA editing frequency", title = "Comparison of RNA editing frequency")
+
+level <- merged_lohhla %>% filter(!is.na(loh), all_cov > 30, EL_score < 0.05) %>% group_by(patient) %>% mutate(nb = n_distinct(loh)) %>% group_by(patient, nb) %>% summarize(frequency = n_distinct(combine),mean_editing_level = mean(all_vaf)) %>% ggplot(aes(x = as.factor(nb), y = mean_editing_level, color = as.factor(nb))) + stat_compare_means()  + geom_jitter() + geom_boxplot() + labs(xlab = "LOHHLA", ylab = "RNA editing level (average)", title = "Comparison of mean RNA editing level")
+
+ggarrange(freq, level, labels = c("A", "B"),ncol = 2, nrow = 1)
+
+proportion <- merged_lohhla %>% filter(!is.na(loh), all_cov>30) %>% group_by(patient) %>% mutate(nb = n_distinct(loh), total = n_distinct(combine)) %>% filter(EL_score<0.1) %>% group_by(patient, nb) %>% summarize(proportion = n_distinct(combine)/total) %>% distinct() %>% ggplot(aes(x = as.factor(nb), y = proportion, color = as.factor(nb))) + stat_compare_means() + geom_boxplot() + geom_jitter() + labs(xlab = "LOHHLA", ylab = "Proportion of neoantigenic RNA editing events", title = "Comparison of RNA editing proportion")
+
+ggarrange(proportion, level, labels = c("A", "B"),ncol = 2, nrow = 1)
+
+
+# Heterogeneous alleles
+freq <- merged_lohhla %>% group_by(patient_region, hla_type,loh) %>% mutate(nb = n_distinct(hla_allele_type)) %>% filter(nb > 1,!is.na(loh),all_cov >30, immune_cat == "hot") %>% ungroup() %>% group_by(patient_region, hla_type, loh) %>% summarize(frequency = n_distinct(combine), mean_editing_level = mean(all_vaf))%>% ggplot(aes(x = loh, y = frequency, color = loh)) + stat_compare_means() + geom_jitter() + geom_boxplot() + labs(xlab = "LOHHLA", ylab = "RNA editing frequency", title = "Comparison of mean RNA editing frequency(hot)")
+
+level <- merged_lohhla %>% group_by(patient_region, hla_type,loh) %>% mutate(nb = n_distinct(hla_allele_type)) %>% filter(nb > 1,!is.na(loh),all_cov >30, immune_cat == "hot") %>% ungroup() %>% group_by(patient_region, hla_type, loh) %>% summarize(frequency = n_distinct(combine), mean_editing_level = mean(all_vaf)) %>% ggplot(aes(x = loh, y = mean_editing_level, color = loh))   + stat_compare_means()  + geom_jitter() + geom_boxplot() + labs(xlab = "LOHHLA", ylab = "RNA editing level (average)", title = "Comparison of mean RNA editing level(hot)")
+
+ggarrange(freq, level, labels = c("A", "B"),ncol = 2, nrow = 1)
+
+proportion <- merged_lohhla %>% group_by(patient_region, hla_type,loh) %>% mutate(nb = n_distinct(hla_allele_type)) %>% filter(nb > 1,!is.na(loh),all_cov >30, immune_cat == "hot") %>% ungroup() %>% group_by(patient_region, hla_type, loh) %>% mutate(total = n_distinct(combine)) %>% filter(EL_score < 0.05) %>% distinct() %>% summarize(proportion = n_distinct(combine)/total) %>% ggplot(aes(x = loh, y = proportion, color = loh))   + stat_compare_means()  + geom_jitter() + geom_boxplot() + labs(xlab = "LOHHLA", ylab = "Proportion of neoantigenic RNA editing events", title = "Comparison of RNA editing proportion(hot)")
+
+ggarrange(proportion, level, labels = c("A", "B"),ncol = 2, nrow = 1)
+```
+## Change the threshold of EL_scores 
+```{r}
+## BY patient region & hla type 
+freq <- merged_lohhla %>% filter(!is.na(loh), all_cov > 30, effect == "nonsynonymous", EL_score < 0.1, immune_cat == "hot") %>% group_by(patient_region, loh) %>% summarize(frequency = n_distinct(rna_ids),average_level = mean(all_vaf)) %>% ggplot(aes(x = loh, y = frequency, color = loh))  + stat_compare_means() + geom_boxplot() + geom_jitter()  + labs(xlab = "LOHHLA", ylab = "RNA editing frequency", title = "Comparison of neoantigenic RNA editing frequency")
+
+level <- merged_lohhla %>% filter(!is.na(loh), all_cov > 30) %>% group_by(patient_region) %>% mutate(total = n_distinct(rna_ids)) %>% filter(effect == "nonsynonymous", EL_score < 0.1, immune_cat == "hot") %>% group_by(patient_region,loh) %>% summarize(proportion = n_distinct(rna_ids)/total , average_level = mean(all_vaf)) %>% ggplot(aes(x = loh, y = average_level, color = loh)) + stat_compare_means()  + geom_jitter() + geom_boxplot() + labs(xlab = "LOHHLA", ylab = "RNA editing level (average)", title = "Comparison of mean RNA editing level")
+
+proportion <- merged_lohhla %>% filter(!is.na(loh), all_cov > 30) %>% group_by(patient_region) %>% mutate(total = n_distinct(rna_ids)) %>% filter(effect == "nonsynonymous", EL_score < 0.1, immune_cat == "hot") %>% group_by(patient_region,loh) %>% summarize(proportion = n_distinct(rna_ids)/total , average_level = mean(all_vaf)) %>% ggplot(aes(x = loh, y = proportion, color = loh)) + stat_compare_means()  + geom_jitter() + geom_boxplot() + labs(xlab = "LOHHLA", ylab = "RNA editing level (average)", title = "Comparison of proportion of neoantigenic RNA editing events")
+
+ggarrange(freq, level,proportion, labels = c("A", "B", "C"),ncol = 3, nrow = 1)
+
+## BY patient 
+lohhla_data2 <- merged_lohhla %>% filter(!is.na(loh), all_cov > 30) %>% group_by(patient) %>% mutate(nb = n_distinct(loh)) %>% select(patient, loh, nb) %>% distinct()
+
+lohhla_data2$loh_by_patient <- lohhla_data2$loh
+lohhla_data2$loh_by_patient[which(lohhla_data2$nb == 2)] <- TRUE 
+lohhla_data2 <- lohhla_data2[,c(1,4)]
+
+merged_lohhla2 <- inner_join(merged_lohhla, lohhla_data2)
+
+freq <- merged_lohhla2 %>% filter(all_cov > 30, effect == "nonsynonymous", EL_score < 0.05) %>% group_by(patient, loh_by_patient) %>% summarize(frequency = n_distinct(combine), average_level = mean(all_vaf)) %>% ggplot(aes(x = loh_by_patient, y = frequency, color = loh_by_patient))  + stat_compare_means() + geom_boxplot() + geom_jitter()  + labs(xlab = "LOHHLA", ylab = "RNA editing frequency", title = "Comparison of neoantigenic RNA editing frequency")
+
+level <- merged_lohhla2 %>% filter(all_cov > 30, effect == "nonsynonymous", EL_score < 0.05) %>% group_by(patient, loh_by_patient) %>% summarize(frequency = n_distinct(combine), average_level = mean(all_vaf)) %>% ggplot(aes(x= as.factor(loh_by_patient), y = average_level, color = as.factor(loh_by_patient))) + stat_compare_means() + geom_jitter() + geom_boxplot() + labs(xlab = "LOHHLA", ylab = "RNA editing level (average)", title = "Comparison of mean RNA editing level")
+
+
+proportion <- merged_lohhla2 %>% filter(all_cov > 30) %>% group_by(patient, loh_by_patient) %>% mutate(total = n_distinct(combine)) %>% filter(effect == "nonsynonymous", EL_score<0.05) %>% group_by(patient, loh_by_patient) %>% summarize(proportion = n_distinct(combine)/total) %>% distinct() %>% ggplot(aes(x = loh_by_patient, y = proportion, color = loh_by_patient)) + stat_compare_means() + geom_boxplot() + geom_jitter() + labs(xlab = "LOHHLA", ylab = "Proportion of neoantigenic RNA editing events", title = "Comparison of RNA editing proportion")
+
+ggarrange(freq, level, proportion, labels = c("A", "B","C"),ncol = 3, nrow = 1)
+```
+
+# Within tumour: compare the RNA editing frequency between hot vs cold regions 
+```{r}
+tumours <- merged_data %>% filter(!is.na(tumour_id), !is.na(immune_cat)) %>% group_by(tumour_id) %>% summarize(nb = n_distinct(immune_cat)) %>% filter(nb > 1)
+
+data <- merged_data[which(merged_data$tumour_id %in% tumours$tumour_id),]
+
+data1 <- data %>% filter(all_cov > 30, !is.na(immune_cat)) %>% group_by(tumour_id, immune_cat) %>% summarize(no.total = n_distinct(rna_ids), average_level = mean(all_vaf)) 
+
+data2 <- data %>% filter(all_cov > 30, !is.na(immune_cat),effect == "nonsynonymous", EL_score < 0.1, EL_GL_score > EL_score) %>% group_by(tumour_id, immune_cat) %>% summarize(no_neo = n_distinct(rna_ids), average_neo = mean(all_vaf)) 
+
+data_merge <- left_join(data1, data2)
+data_merge$no_neo[which(is.na(data_merge$no_neo))] <- 0 
+data_merge$average_neo[which(is.na(data_merge$average_neo))] <- 0 
+data_merge$proportion <- data_merge$no_neo/data_merge$no.total
+
+freq <- data_merge %>% ggplot(aes(x = immune_cat, y = no.total , color = immune_cat)) + geom_boxplot() + geom_point() + geom_line(aes(group= tumour_id)) +  stat_compare_means() + labs(x= "Immune category", y = "No. of total RNA editing events")
+
+level <- data_merge %>% filter(no_neo != 0) %>%  ggplot(aes(x = immune_cat, y = average_neo, color = immune_cat)) + geom_boxplot() + geom_point() + geom_line(aes(group= tumour_id)) +  stat_compare_means(paried = TRUE) + labs(x= "Immune category", y = "Average RNA editing level")
+
+proportion <- data_merge %>% ggplot(aes(x = immune_cat, y = proportion, color = immune_cat)) + geom_boxplot() + geom_point() + geom_line(aes(group= tumour_id)) +  stat_compare_means(paried = TRUE) + labs(x= "Immune category", y = "Proportion of neoantigenic RNA editing events")
+
+neo_freq <- data_merge %>% ggplot(aes(x = immune_cat, y = no_neo, color = immune_cat)) + geom_boxplot() + geom_point() + geom_line(aes(group= tumour_id)) +  stat_compare_means(paired = TRUE) + labs(x= "Immune category", y = "No. of neo-antigenic RNA editing events")
+
+ggarrange(freq, level, proportion, labels = c("A", "B","C"),ncol = 3, nrow = 1)
+
+
+```
+
+## Compare the expression of genes with neo-antigenic RNA editing events between hot vs cold regions 
+```{r}
+test <- merged_data %>% filter(effect == "nonsynonymous", EL_score < 0.1, EL_score < EL_GL_score) %>% select(rna_ids, hla_allele_type, symbol, patient_region, tumour_id,immune_cat) %>% distinct()
+
+genes <- unique(test$symbol)
+
+neo_transcript <- transcript[which(transcript$gene_id %in% genes),]
+length(colnames(neo_transcript))
+
+neo_transcript2 <- neo_transcript %>% pivot_longer("CRUK0001_SU_T1-R1":"CRUK0893_SU_T1-R2", names_to = "patient_region", values_to = "expression")
+
+test2 <- test %>% filter(!is.na(immune_cat)) %>% select(patient_region, tumour_id, immune_cat) %>% distinct()
+
+neo_transcript3 <- merge(test2, neo_transcript2)
+
+neo_transcript3 %>% group_by(tumour_id,gene_id) %>% mutate(nb = n_distinct(immune_cat)) %>% filter(nb > 1) %>% group_by(gene_id, immune_cat) %>% summarize(average_expression = mean(expression)) %>% ggplot(aes(x = immune_cat, y= log10(average_expression), color = immune_cat)) + geom_boxplot() + geom_line(aes(group = gene_id)) + stat_compare_means(paired= TRUE)
+
+neo_transcript3 %>% group_by(tumour_id,gene_id) %>% mutate(nb = n_distinct(immune_cat)) %>% filter(nb > 1) %>% ggplot(aes(x = log10(expression), y= gene_id, color = immune_cat)) + geom_boxplot() + stat_compare_means()
+
+neo_transcript3 %>% group_by(tumour_id,gene_id) %>% mutate(nb = n_distinct(immune_cat)) %>% filter(nb > 1) %>% ggplot(aes(x = immune_cat , y= log10(expression), color = immune_cat)) + geom_boxplot() + facet_wrap(~gene_id) + stat_compare_means(label.y = 2) 
+
+```
+
+## Neo-antigenic RNA editing frequency & level (high vs low) -- cell type abundance 
+```{r}
+merged_data %>% select(rna_ids, effect, hla_allele_type, EL_score, patient_region, tumour_id, all_vaf, all_cov, symbol) %>% group_by(patient_region) %>% mutate(total = n_distinct(rna_ids)) %>% filter(!is.na(tumour_id), all_cov > 30, EL_score < 0.05, effect == "nonsynonymous") %>% mutate(proportion = n_distinct(rna_ids)/total, average_level = mean(all_vaf)) %>% distinct() %>% ggplot(aes(x=average_level, y=proportion)) + geom_point()
+
+test <- merged_data %>% filter(!is.na(tumour_id), effect == "nonsynonymous", EL_score < 0.05) %>% select(rna_ids, hla_allele_type, tumour_id, all_vaf, EL_score, symbol,combine) %>% distinct() %>% group_by(rna_ids, hla_allele_type) %>% mutate(nb_tumour = n_distinct(tumour_id)) %>% mutate(proportion = nb_tumour/354) %>% group_by(symbol) %>% summarize(average = max(proportion), editing_level = mean(all_vaf)/2) %>% arrange(desc(average))
+
+test %>% distinct() %>% pivot_longer(c(average, editing_level), names_to = "Type",values_to = "value") %>% ggplot(aes(x=symbol, y = value,fill= Type)) + 
+  geom_col(position="dodge") + 
+  scale_y_continuous(sec.axis = sec_axis(~ .*2, name = "Mean editing level"))+
+  labs(y="Tumours with editing (proportion)", x = "Gene symbol") + my_theme + scale_x_discrete(guide = guide_axis(angle = 90)) 
+
+
+unique(merged_data$hla_type)
+
+```
+
+# By patient: Compare binding affinity/ editing level between tumour-specific, normal-specific and shared RNA editing events 
+```{r}
+test <- merged_data %>% filter(effect == "nonsynonymous", EL_GL_score > EL_score, EL_score < 0.1, all_cov > 30)
+
+test %>% filter(!is.na(feature)) %>% group_by(rna_ids, feature, hla_type) %>% summarize(average_EL = mean(EL_score)) %>% ggplot(aes(x = feature, y = average_EL, color = feature)) + geom_boxplot() + geom_point() +  stat_compare_means() + facet_grid(~hla_type)
+
+test %>% filter(!is.na(feature)) %>% select(rna_ids, feature, hla_type, EL_score) %>% distinct() %>% group_by(rna_ids, feature, hla_type) %>% ggplot(aes(x = feature, y = EL_score, color = feature)) + geom_boxplot() + geom_point() + stat_compare_means() + facet_grid(~ hla_type)
+
+```
+
+# About lohhla -- find the most common loss HLA
+```{r}
+# Split the string for allele1 
+allele1 <- strsplit(lohhla_data$allele1,"_")
+alleles <- data.frame()
+for (i in 1:length(allele1)){
+  allele <- paste0(toupper(allele1[[i]][1]),"-",toupper(allele1[[i]][2]), "*",toupper(allele1[[i]][3]),":",toupper(allele1[[i]][4]))
+  alleles <- rbind(alleles, allele)
+}
+lohhla_data$allele.1 <- alleles$X.HLA.A.03.01.
+
+# Split the string for allele2 
+allele2 <- strsplit(lohhla_data$allele2,"_")
+alleles <- data.frame()
+for (i in 1:length(allele2)){
+  allele <- paste0(toupper(allele2[[i]][1]),"-",toupper(allele2[[i]][2]), "*",toupper(allele2[[i]][3]),":",toupper(allele2[[i]][4]))
+  alleles <- rbind(alleles, allele)
+}
+lohhla_data$allele.2 <- alleles$X.HLA.A.32.01.
+
+# pivot_longer and determine which allele is lost based on cn1_binned & cn2_binned values 
+lohhla_data <- lohhla_data %>% filter(!is.na(cn1_binned), !is.na(cn2_binned)) %>% pivot_longer(c(allele.1, allele.2), names_to = "allele_type", values_to = "HLA")
+
+allele1 <- lohhla_data %>% filter(allele_type == "allele.1")
+allele1$HLA_loss <- ifelse(allele1$cn1_binned < allele1$cn2_binned, "TRUE","FALSE")
+
+allele2 <- lohhla_data %>% filter(allele_type == "allele.2")
+allele2$HLA_loss <- ifelse(allele2$cn2_binned < allele2$cn1_binned, "TRUE", "FALSE")
+
+lohhla_data <- rbind(allele1, allele2) %>% arrange(patient_region, patient, allele1, allele2)
+
+# Count the number of tumour_ids that carry specific HLA allele
+lohhla_data <- lohhla_data %>% group_by(HLA, HLA_loss) %>% mutate(no.tumour = n_distinct(tumour_id), no.region = n_distinct(patient_region)) 
+
+lohhla_true <- lohhla_data %>% select(patient_region, patient, tumour_id, hla_type, loh, allele_type, HLA, HLA_loss, no.tumour, no.region) %>% filter(loh == "TRUE") %>% distinct()
+
+# Get Neoantigenic RNA editing events 
+neoantigen <- merged_data %>% filter(effect == "nonsynonymous", EL_score < 0.1, EL_GL_score > EL_score, all_cov > 30)
+
+test <- inner_join(neoantigen, lohhla_true)
+
+#matched_HLA <- lohhla_true[which(lohhla_true$HLA %in% neoantigen$HLA),]
+
+# Compare the binding affinity (EL_scores) between neoantigens with HLA_loss and not loss 
+test %>% ggplot(aes(x = HLA_loss, y = EL_score)) + geom_boxplot() + geom_point() + stat_compare_means()
+
+# Among patients with both TRUE and FALSE
+test %>% group_by(patient) %>% mutate(nb = n_distinct(HLA_loss)) %>% filter(nb > 1) %>% ggplot(aes(x = HLA_loss, y = EL_score)) + geom_boxplot() + geom_point() + stat_compare_means()
+
+test %>% group_by(patient) %>% mutate(nb = n_distinct(HLA_loss)) %>% filter(nb > 1) %>% ggplot(aes(x = HLA_loss, y = all_vaf)) + geom_boxplot() + geom_point() + stat_compare_means()
+
+# Plot the percentage of HLA loss by patient 
+test %>% group_by(patient) %>% mutate(total_combine = n_distinct(combine)) %>% filter(HLA_loss == "TRUE") %>% group_by(patient) %>% summarize(proportion = n_distinct(combine)/total_combine) %>% distinct() %>% ggplot(aes(x = proportion, y = patient)) + geom_bar(stat ="identity")
+
+# Frequency of muttype_nostrand among neo-antigenic RNA editing events 
+neoantigen %>% filter(feature == "tumour-specific") %>% group_by(muttype_nostrand) %>% summarize(proportion = n_distinct(rna_ids)/38, no.rna_ids = n_distinct(rna_ids)) %>% ggplot(aes(x = muttype_nostrand, y = no.rna_ids, fill = muttype_nostrand)) + geom_bar(stat = "identity")
+
+# Proportion of muttype_nostrand among neo-antigenic RNA editing events 
+neoantigen %>% group_by(muttype_nostrand) %>% summarize(proportion = n_distinct(rna_ids)/38, no.rna_ids = n_distinct(rna_ids)) %>% ggplot(aes(x = muttype_nostrand, y = proportion, fill = muttype_nostrand)) + geom_bar(stat = "identity")
+```
+
+
+
+
+
+# 07-27-2022
+# 1. Survival analysis based on the no. of neoantigenic rna editing events 
+```{r}
+library(survival)
+library(survminer)
+
+# Import data 
+survival <- readRDS("20220407_TRACERx421_all_tumour_df.rds")
+colnames(survival)[1] <- "patient_region"
+
+# Count the no. of total RNA editing and no./proportion of neoantigenic RNA editing events per patient 
+no_rna <- merged_data %>% filter(effect == "nonsynonymous") %>% group_by(patient_region) %>% summarize(no.rna_ids = n_distinct(rna_ids))
+
+no_neoantigen <- merged_data %>% filter(neoantigenic == TRUE) %>% group_by(patient_region) %>% summarize(no.neoantigen = n_distinct(combine))   
+table(no_neoantigen$no.neoantigen)
+
+proportion_neoantigen <- merged_data %>% group_by(patient_region) %>% mutate(total = n_distinct(rna_ids)) %>%
+  filter(neoantigenic == TRUE) %>% summarize(proportion = n_distinct(rna_ids)/total) %>% distinct()
+
+# Merge with survival data 
+no_neoantigen <- inner_join(no_neoantigen, survival)
+no_rna <- inner_join(no_rna, survival)
+proportion_neoantigen <- inner_join(proportion_neoantigen, survival)
+
+# Survival analysis and KM plot 
+## no. of neoantigenic RNA editing events 
+no_neoantigen$variable_of_interest <- NA
+no_neoantigen$variable_of_interest <- no_neoantigen$no.neoantigen>median(no_neoantigen$no.neoantigen,na.rm = T)
+
+kmfit <- survfit(Surv(dfs_time, cens_dfs) ~ variable_of_interest, data= no_neoantigen)
+ggsurvplot(kmfit, data = no_neoantigen, pval = TRUE, title = "DFS by no. of neoantigenic RNA editing events")
+kmfit <- survfit(Surv(os_time, cens_os) ~ variable_of_interest, data= no_neoantigen)
+ggsurvplot(kmfit, data = no_neoantigen, pval = TRUE, title = "OS by no. of neoantigenic RNA editing events")
+
+## Total no. of rna editing events 
+no_rna$variable_of_interest <- NA
+no_rna$variable_of_interest <- no_rna$no.rna_ids>median(no_rna$no.rna_ids,na.rm = T)
+
+kmfit <- survfit(Surv(dfs_time, cens_dfs) ~ variable_of_interest, data=no_rna)
+ggsurvplot(kmfit, data = no_rna, pval = TRUE, title = "DFS by total no. of RNA editing events")
+kmfit <- survfit(Surv(os_time, cens_os) ~ variable_of_interest, data=no_rna)
+ggsurvplot(kmfit, data = no_rna, pval = TRUE, title = "OS by total no. of RNA editing events")
+
+## Proportion of neoantigenic RNA editing events 
+proportion_neoantigen$variable_of_interest <- NA
+proportion_neoantigen$variable_of_interest <- proportion_neoantigen$proportion>median(proportion_neoantigen$proportion,na.rm = T)
+
+kmfit <- survfit(Surv(dfs_time, cens_dfs) ~ variable_of_interest, data=proportion_neoantigen)
+ggsurvplot(kmfit, data = proportion_neoantigen, pval = TRUE, title = "DFS by proportion of neoantigenic RNA editing events")
+kmfit <- survfit(Surv(os_time, cens_os) ~ variable_of_interest, data=proportion_neoantigen)
+ggsurvplot(kmfit, data = proportion_neoantigen, pval = TRUE, title = "OS by proportion of neoantigenic RNA editing events")
+
+## Survival analysis by tumour stage
+stages <- unique(no_neoantigen$NSCLCstage)
+for (x in stages){
+  data <- no_neoantigen %>% filter(NSCLCstage == x)
+  title1 <- paste0("DFS by no. of neoantigenic RNA editing for NSCLC stage", x)
+  title2 <- paste0("OS by no. of neoantigenic RNA editing for NSCLC stage", x)
+  
+  kmfit <- survfit(Surv(dfs_time, cens_dfs) ~ variable_of_interest, data=data)
+  p <- ggsurvplot(kmfit, data = data, pval = TRUE, title = title1)
+  print(p)
+  
+  kmfit <- survfit(Surv(os_time, cens_os) ~ variable_of_interest, data=data)
+  q <- ggsurvplot(kmfit, data = data, pval = TRUE, title = title2)
+  print(q)
+}
+
+## Survival analysis by gender 
+gender <- unique(no_neoantigen$sex)
+
+for (x in gender){
+  data <- no_neoantigen %>% filter(sex == x)
+  title1 <- paste0("DFS by no. of neoantigenic RNA editing for ", x)
+  title2 <- paste0("OS by no. of neoantigenic RNA editing for ", x)
+  
+  kmfit <- survfit(Surv(dfs_time, cens_dfs) ~ variable_of_interest, data=data)
+  p <- ggsurvplot(kmfit, data = data, pval = TRUE, title = title1)
+  print(p)
+  
+  kmfit <- survfit(Surv(os_time, cens_os) ~ variable_of_interest, data=data)
+  q <- ggsurvplot(kmfit, data = data, pval = TRUE, title = title2)
+  print(q)
+}
+
+table(no_neoantigen$sex, no_neoantigen$variable_of_interest)
+
+### Conclusion: none of them are significant, no. of neoantigenic RNA editing events sometimes correlates with worse survival which might be because some RNA editing events are related to tumour progression & drug resistance 
+```
+
+# 2. Compare the ratio of neoantigenic RNA editing events/ total RNA editing events with rate of genomic alterations 
+```{r}
+
+```
+# 3. Look at the co-occurrence/co-localisation of genomic alterations and RNA editing events
+```{r}
+
+```
+
+
+
+# Further exploraion: comparison 
+```{r}
+# Compare the no./frequency/proportion/ editing level/ binding affinity of neoantigenic RNA editing events between: 
+
+# 1. Hot vs cold regions 
+  # No. of (neo-antigenic) RNA editing events 
+merged_data %>% filter(!is.na(tumour_id), !is.na(immune_cat)) %>% 
+  group_by(tumour_id, patient_region, immune_cat) %>% mutate(total_rna = n_distinct(rna_ids)) %>% 
+  filter(effect == "nonsynonymous", all_cov > 30,EL_score < 0.1, EL_GL_score > EL_score) %>% mutate(neo_rna = n_distinct(rna_ids), proportion = n_distinct(rna_ids)/total_rna) %>% 
+  ggplot(aes(x = immune_cat, y = proportion, color = immune_cat)) + geom_boxplot() + geom_point() + stat_compare_means() # total_rna, neo_rna, proportion 
+
+  # Frequency of (neo-antigenic) RNA editing events
+merged_data %>% filter(!is.na(immune_cat), !is.na(tumour_id), effect == "nonsynonymous", all_cov > 30,EL_score < 0.1, EL_GL_score > EL_score) %>% group_by(rna_ids) %>% mutate(total_frequency = n_distinct(patient_region)) %>% group_by(rna_ids, immune_cat) %>% summarize(freq_by_cat = n_distinct(patient_region), proportion_freq = n_distinct(patient_region)/total_frequency) %>% 
+  ggplot(aes(x = immune_cat, y = proportion_freq, color = immune_cat)) + geom_boxplot() + geom_point() + stat_compare_means()
+
+merged_data %>% filter(!is.na(immune_cat), !is.na(tumour_id), effect == "nonsynonymous", all_cov > 30,EL_score < 0.1, EL_GL_score > EL_score) %>% group_by(rna_ids) %>% mutate(total_frequency = n_distinct(patient_region)) %>% group_by(rna_ids, immune_cat) %>% summarize(freq_by_cat = n_distinct(patient_region), proportion_freq = n_distinct(patient_region)/total_frequency) %>% 
+  ggplot(aes(x = immune_cat, y = freq_by_cat, color = immune_cat)) + geom_boxplot() + geom_point() + stat_compare_means()
+
+merged_data %>% filter(!is.na(immune_cat), !is.na(tumour_id)) %>% group_by(hla_allele_type) %>% mutate(total_region = n_distinct(patient_region)) %>% group_by(rna_ids, hla_allele_type,immune_cat) %>% summarize(freq = n_distinct(patient_region)/total_region) %>% 
+  ggplot(aes(x = immune_cat, y = freq, color = immune_cat)) + geom_boxplot() + geom_point() + stat_compare_means()
+
+  # RNA editing level 
+merged_data %>% filter(!is.na(immune_cat), !is.na(tumour_id), all_cov > 30) %>% group_by(patient_region, immune_cat) %>% summarize(mean_editing_level = mean(all_vaf)) %>% ggplot(aes(x = immune_cat, y = mean_editing_level, color = immune_cat)) + geom_boxplot() + geom_point() + stat_compare_means() #Total RNA editing events 
+
+merged_data %>% filter(!is.na(immune_cat), !is.na(tumour_id), effect == "nonsynonymous", all_cov > 30,EL_score < 0.1, EL_GL_score > EL_score) %>% group_by(patient_region, immune_cat) %>% summarize(mean_editing_level_neo = mean(all_vaf)) %>% ggplot(aes(x = immune_cat, y = mean_editing_level_neo, color = immune_cat)) + geom_boxplot() + geom_point() + stat_compare_means() #neo-antigenic RNA editing events 
+
+merged_data %>% filter(!is.na(immune_cat)) %>% group_by(patient) %>% mutate(nb = n_distinct(immune_cat)) %>% filter(nb > 1, !is.na(tumour_id), all_cov > 30) %>% group_by(patient_region, immune_cat) %>% summarize(mean_editing_level = mean(all_vaf)) %>% ggplot(aes(x = immune_cat, y = mean_editing_level, color = immune_cat)) + geom_boxplot() + geom_point() + stat_compare_means() # patients with both hot & cold, total rna_ids, average editing level by patient_region
+
+merged_data %>% filter(!is.na(immune_cat)) %>% group_by(patient) %>% mutate(nb = n_distinct(immune_cat)) %>% filter(nb > 1, !is.na(tumour_id), all_cov > 30,effect == "nonsynonymous",EL_score < 0.1, EL_GL_score > EL_score) %>% group_by(patient_region, immune_cat) %>% summarize(mean_editing_level = mean(all_vaf)) %>% ggplot(aes(x = immune_cat, y = mean_editing_level, color = immune_cat)) + geom_boxplot() + geom_point() + stat_compare_means()  # patients with both hot & cold, neo-antigenic rna_ids, average editing level by patient_region
+
+merged_data %>% filter(!is.na(immune_cat)) %>% group_by(patient) %>% mutate(nb = n_distinct(immune_cat)) %>% filter(nb > 1, !is.na(tumour_id), all_cov > 30) %>% group_by(patient, immune_cat) %>% summarize(mean_editing_level = mean(all_vaf)) %>% ggplot(aes(x = immune_cat, y = mean_editing_level, color = immune_cat)) + geom_boxplot() + geom_point() + stat_compare_means() + geom_line(aes(group = patient)) # patients with both hot & cold, total rna_ids, average editing level by patient
+
+merged_data %>% filter(!is.na(immune_cat)) %>% group_by(patient) %>% mutate(nb = n_distinct(immune_cat)) %>% filter(nb > 1, !is.na(tumour_id), all_cov > 30,effect == "nonsynonymous",EL_score < 0.1, EL_GL_score > EL_score) %>% group_by(patient, immune_cat) %>% summarize(mean_editing_level = mean(all_vaf)) %>% ggplot(aes(x = immune_cat, y = mean_editing_level, color = immune_cat)) + geom_boxplot() + geom_point() + stat_compare_means() + geom_line(aes(group = patient)) # patients with both hot & cold, neo-antigenic rna_ids, average editing level by patient
+
+  # Binding affinity 
+merged_data %>% filter(!is.na(immune_cat), !is.na(EL_score)) %>% select(patient_region, immune_cat, rna_ids, EL_score) %>% distinct() %>% ggplot(aes(x = immune_cat, y = EL_score, color = immune_cat)) + geom_boxplot() + geom_point() + stat_compare_means() # total RNA_ids 
+
+merged_data %>% filter(!is.na(immune_cat), !is.na(EL_score),effect == "nonsynonymous",EL_score < 0.1, EL_GL_score > EL_score) %>% select(patient_region, immune_cat, rna_ids, EL_score) %>% distinct() %>% ggplot(aes(x = immune_cat, y = EL_score, color = immune_cat)) + geom_boxplot() + geom_point() + stat_compare_means() + geom_jitter() # Neo-antigenic RNA_ids 
+
+merged_data %>% filter(!is.na(immune_cat),!is.na(EL_score),effect == "nonsynonymous",EL_score < 0.1, EL_GL_score > EL_score) %>% group_by(patient, immune_cat) %>% summarize(mean_EL_score = mean(EL_score)) %>% ggplot(aes(x = immune_cat, y = mean_EL_score, color = immune_cat)) + geom_boxplot() + geom_point() + stat_compare_means() # Neo-antigenic RNA_ids # binding affinity by patient
+  
+merged_data %>% filter(!is.na(immune_cat), !is.na(EL_score)) %>% group_by(patient_region, immune_cat) %>% summarize(mean_EL_score = mean(EL_score)) %>% ggplot(aes(x = immune_cat, y = mean_EL_score, color = immune_cat)) + geom_boxplot() + geom_point() + stat_compare_means() # total RNA_ids # binding affinity by patient_region 
+
+merged_data %>% filter(!is.na(immune_cat), !is.na(EL_score),effect == "nonsynonymous",EL_score < 0.1, EL_GL_score > EL_score) %>% group_by(patient_region, immune_cat) %>% summarize(mean_EL_score = mean(EL_score)) %>% ggplot(aes(x = immune_cat, y = mean_EL_score, color = immune_cat)) + geom_boxplot() + geom_point() + stat_compare_means() # neo-antigenic RNA_ids # binding affinity by patient_region 
+
+# 2. Tumour-specific vs shared RNA editing events
+merged_data %>% filter(!is.na(EL_score),neoantigenic == TRUE) %>% select(patient_region, rna_ids, EL_score,all_vaf, tumour_specific) %>% distinct() %>% 
+  ggplot(aes(x = tumour_specific, y = EL_score, color = tumour_specific)) + geom_boxplot() + geom_point() + stat_compare_means() + geom_jitter()
+
+merged_data %>% filter(!is.na(EL_score),neoantigenic == TRUE) %>% select(patient_region, rna_ids, EL_score, all_vaf,  tumour_specific) %>% distinct() %>% ggplot(aes(x = tumour_specific, y = all_vaf, color = tumour_specific)) + geom_boxplot() + geom_point() + stat_compare_means() + geom_jitter()
+
+merged_data %>% filter(!is.na(EL_score),neoantigenic == TRUE) %>% group_by(rna_ids, tumour_specific) %>% summarize(nb = n_distinct(patient_region)) %>% ggplot(aes(x = tumour_specific, y = nb, color = tumour_specific)) + geom_boxplot() + geom_point() + stat_compare_means() + geom_jitter()
+
+# Compare the no./proportion of tumour-specific RNA editing events between immune hot vs cold regions
+merged_data %>% filter(!is.na(EL_score), !is.na(immune_cat), tumour_specific == TRUE, neoantigenic == TRUE) %>% group_by(immune_cat, patient_region) %>% summarize(nb = n_distinct(rna_ids)) %>% ggplot(aes(x = immune_cat, y = nb, color = immune_cat)) + geom_boxplot() + geom_point() + stat_compare_means() 
+
+merged_data %>% filter(!is.na(EL_score), !is.na(immune_cat), neoantigenic == TRUE) %>% group_by(immune_cat, patient_region) %>% mutate(total = n_distinct(rna_ids)) %>% filter(tumour_specific == TRUE) %>% summarize(proportion = n_distinct(rna_ids)/total) %>% ggplot(aes(x = immune_cat, y = proportion, color = immune_cat)) + geom_boxplot() + geom_point() + stat_compare_means() 
+
+merged_data %>% filter(!is.na(EL_score), !is.na(immune_cat), neoantigenic == TRUE) %>% group_by(patient_region, immune_cat) %>% summarize(mean_EL_score = mean(EL_score)) %>%  ggplot(aes(x = immune_cat, y = mean_EL_score, color = immune_cat)) + geom_boxplot() + geom_point() + stat_compare_means() 
+
+
+# Stacked bar plot showing the number/proportion of tumour-specific RNA ids in cold vs hot tumour regions
+# Proportion of muttype_nostrand for neo-antigenic RNA editing events which are tumour-specific and shared
+# Proportion of HLA types that neo-antigenic RNA_ids mainly bind to 
+
+merged_data$present_normal <- as.factor(merged_data$present_normal)
+
+# Interesting findings
+  # Cold-tumour specific RNA editing events 
+hot <- merged_data %>% filter(immune_cat == "hot") %>% select(rna_ids, combine, patient_region, tumour_id)
+cold <- merged_data %>% filter(immune_cat == "cold") %>% select(rna_ids, combine, patient_region, tumour_id)
+
+length(unique(intersect(hot$rna_ids, cold$rna_ids)))
+setdiff(cold$rna_ids, hot$rna_ids)
+
+merged_data %>% filter(rna_ids == "chr5:149782704:C:T") %>% group_by(rna_ids, symbol) %>% summarize(nb_region = n_distinct(patient_region), nb_tumour = n_distinct(tumour_id), rna_editing = mean(all_vaf))
+
+```
+# Identify truly tumour-specific RNA editing events 
+```{r}
+tumour <- merged_data %>% filter(sample_type == "tumour")
+tumour <- unique(tumour$rna_ids)
+normal <- merged_data %>% filter(sample_type == "normal")
+normal <- unique(normal$rna_ids)
+shared <- intersect(tumour, normal)
+tumour_specific <- setdiff(tumour, normal)
+
+merged_data$feature2 <- NA
+merged_data$feature2[which(merged_data$rna_ids %in% shared)] <- "shared"
+merged_data$feature2[which(merged_data$rna_ids %in% tumour_specific)] <- "tumour-specific"
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
